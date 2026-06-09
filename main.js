@@ -42,14 +42,49 @@ ipcMain.handle('load-instagram', async () => {
 });
 
 ipcMain.handle('get-script', async () => {
-  const scriptPath = path.join(__dirname, 'instatakker-core.js');
+  const remoteUrl = 'https://raw.githubusercontent.com/issaghostlife/instatakker/main/instatakker.js';
+  const localPath = path.join(__dirname, 'instatakker-core.js');
+  const cachePath = path.join(app.getPath('userData'), 'instatakker-core-cache.js');
 
-  if (!fs.existsSync(scriptPath)) {
-    console.log('[ERROR] Missing instatakker-core.js at:', scriptPath);
+  try {
+    console.log('[APP] Checking latest Instatakker core from GitHub...');
+
+    const res = await fetch(remoteUrl, {
+      headers: {
+        'Cache-Control': 'no-cache',
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`GitHub returned ${res.status}`);
+    }
+
+    const script = await res.text();
+
+    if (!script || !script.includes('Instatakker')) {
+      throw new Error('Downloaded script did not look valid');
+    }
+
+    fs.writeFileSync(cachePath, script, 'utf8');
+    console.log('[APP] Loaded latest core from GitHub');
+
+    return script;
+  } catch (err) {
+    console.log('[APP] Could not load remote core. Using backup.', err.message);
+
+    if (fs.existsSync(cachePath)) {
+      console.log('[APP] Using cached core script');
+      return fs.readFileSync(cachePath, 'utf8');
+    }
+
+    if (fs.existsSync(localPath)) {
+      console.log('[APP] Using bundled local core script');
+      return fs.readFileSync(localPath, 'utf8');
+    }
+
+    console.log('[ERROR] No core script available');
     return '';
   }
-
-  return fs.readFileSync(scriptPath, 'utf8');
 });
 
 ipcMain.handle('save-limits', async (event, data) => {
