@@ -42,7 +42,7 @@ ipcMain.handle('load-instagram', async () => {
 });
 
 ipcMain.handle('get-script', async () => {
-  const remoteUrl = 'https://raw.githubusercontent.com/issaghostlife/instatakker/main/instatakker.js';
+  const remoteUrl = 'https://raw.githubusercontent.com/issaghostlife/instatakker-app/main/instatakker-core.js';
   const localPath = path.join(__dirname, 'instatakker-core.js');
   const cachePath = path.join(app.getPath('userData'), 'instatakker-core-cache.js');
 
