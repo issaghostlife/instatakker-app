@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Instatakker</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Title Bar -->
+  <div id="titlebar">
+    <div id="titlebar-drag">
+      <span id="title-icon">⏹</span>
+      <span id="title-text">Instatakker</span>
+    </div>
+    <div id="titlebar-controls">
+      <button class="title-btn" id="btn-minimize" title="Minimize">─</button>
+      <button class="title-btn" id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+
+  <!-- Main Layout -->
+  <div id="app">
+    <!-- Left Panel -->
+    <div id="panel">
+      <!-- Mode Tabs -->
+      <div id="mode-tabs">
+        <button class="mode-btn active" data-mode="unfollow">Unfollow</button>
+        <button class="mode-btn" data-mode="like">Like</button>
+      </div>
+
+      <!-- Learned Limits Banner -->
+      <div id="learned-banner" style="display:none;">
+        <span id="learned-text">🧠 Learning...</span>
+        <span id="learned-stats"></span>
+      </div>
+
+      <!-- Status -->
+      <div id="status">Press <kbd>Enter</kbd> to start</div>
+
+      <!-- Stats Grid -->
+      <div id="stats-grid">
+        <div class="stat-box">
+          <div class="stat-label">Count</div>
+          <div class="stat-value" id="stat-count">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Progress</div>
+          <div class="stat-value" id="stat-progress">0 / 300</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Hourly</div>
+          <div class="stat-value" id="stat-hourly">0 / 200</div>
+        </div>
+        <div class="stat-box" id="stat-comments-box">
+          <div class="stat-label">Comments/Post</div>
+          <div class="stat-value" id="stat-comments">0</div>
+        </div>
+      </div>
+
+      <!-- Progress Bar -->
+      <div id="progress-bar">
+        <div id="progress-fill"></div>
+      </div>
+
+      <!-- Engaged Row -->
+      <div id="engaged-row">
+        <span>Posts: <span id="engaged-posts">0</span></span>
+        <span>Comments: <span id="engaged-comments">0</span></span>
+      </div>
+
+      <!-- Log -->
+      <div id="log">
+        <div id="log-content">Ready. Click "Open Instagram" to start.</div>
+      </div>
+
+      <!-- Controls -->
+      <div id="controls">
+        <button id="btn-open" class="btn btn-secondary">🌐 Open Instagram</button>
+        <button id="btn-start" class="btn btn-primary">▶ Start (Enter)</button>
+      </div>
+
+      <!-- Settings -->
+      <details id="settings">
+        <summary>⚙️ Settings</summary>
+        <div id="settings-content">
+          <div class="setting-group" id="settings-unfollow">
+            <label>Max Unfollows</label>
+            <input type="number" id="cfg-unfollow-max" value="100" min="1" max="500">
+            <label>Hourly Limit</label>
+            <input type="number" id="cfg-unfollow-hourly" value="60" min="1" max="200">
+          </div>
+          <div class="setting-group" id="settings-like" style="display:none;">
+            <label>Max Likes</label>
+            <input type="number" id="cfg-like-max" value="300" min="1" max="1000">
+            <label>Max Comments/Post</label>
+            <input type="number" id="cfg-like-comments" value="150" min="1" max="500">
+            <label>Hourly Limit</label>
+            <input type="number" id="cfg-like-hourly" value="200" min="1" max="500">
+          </div>
+        </div>
+      </details>
+
+      <!-- Footer -->
+      <div id="footer">v1.0.0 | Press Enter to start/stop</div>
+    </div>
+
+    <!-- Right Panel (Browser) -->
+    <div id="browser-panel" style="display:none;">
+      <div id="browser-toolbar">
+        <button id="btn-back" class="nav-btn" title="Back">←</button>
+        <button id="btn-forward" class="nav-btn" title="Forward">→</button>
+        <button id="btn-refresh" class="nav-btn" title="Refresh">⟳</button>
+        <input type="text" id="url-bar" readonly>
+        <button id="btn-toggle-panel" class="nav-btn" title="Toggle Panel">☰</button>
+      </div>
+      <webview id="browser" src="about:blank"></webview>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
