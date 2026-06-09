@@ -13,7 +13,13 @@
 </p>
 
 ---
+## Download for Windows
 
+Go to the **Releases** page and download:
+
+`Instatakker 1.0.0.exe`
+
+No install needed. Just download and run the app.
 ## Overview
 
 **InstaTakker App** is a desktop companion app for managing Instagram workflow tasks in one clean window.
