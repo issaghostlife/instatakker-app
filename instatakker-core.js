@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instatakker
 // @namespace    http://instatakker.io
-// @version      1.1.0
+// @version      1.0.0
 // @description  Instagram automation — unfollow + like everything (posts + comments) like a human
 // @author       Instatakker
 // @match        https://www.instagram.com/*
@@ -12,7 +12,7 @@
 (function() {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.0.0';
 
   // ======================== CONFIG ========================
 
