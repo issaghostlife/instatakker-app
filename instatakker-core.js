@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Instatakker
 // @namespace    http://instatakker.io
-// @version      1.1.0
-// @description  Instagram automation — unfollow + like everything (posts + comments) like a human
+// @version      1.0.0
+// @description  Instagram automation — unfollow + like everything (posts + comments) with adaptive learning
 // @author       Instatakker
 // @match        https://www.instagram.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=instagram.com
@@ -12,9 +12,11 @@
 (function() {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.0.0';
 
-  // ======================== CONFIG ========================
+  // ========================================================================
+  //  CONFIG
+  // ========================================================================
 
   const DEFAULTS = {
     unfollow: {
@@ -37,16 +39,16 @@
     },
   };
 
-  let config = {
+  const cfg = {
     unfollow: { ...DEFAULTS.unfollow },
-    like: { ...DEFAULTS.like },
+    like:   { ...DEFAULTS.like },
   };
 
   let running = false;
   let stopped = false;
   let mode = 'unfollow';
 
-  let state = {
+  const st = {
     unfollowed: 0,
     liked: 0,
     commentsLiked: 0,
@@ -58,236 +60,276 @@
     consecutiveErrors: 0,
   };
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const randDelay = (min, max) =>
-    Math.floor(Math.random() * (max - min + 1)) + min;
+  // ---------- helpers ----------
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  function log(msg) {
-    console.log(`[Instatakker] ${msg}`);
-  }
+  const log = msg => console.log(`[Instatakker v${VERSION}] ${msg}`);
 
-  // ======================== HUMAN-LIKE BEHAVIOR ========================
-
-  /**
-   * Generate a human-like delay pattern.
-   * Humans don't click at perfectly random intervals.
-   * They have bursts of activity followed by pauses.
-   */
+  // ---------- human-like delay patterns ----------
   function humanDelay(baseMin, baseMax) {
-    // Occasionally take a longer "break" like a human would
-    const pauseChance = Math.random();
-    if (pauseChance < 0.08) {
-      // 8% chance of a "let me read this" pause
-      return randDelay(5000, 12000);
-    }
-    if (pauseChance < 0.12) {
-      // 4% chance of a "distracted" pause
-      return randDelay(10000, 25000);
-    }
-
-    // Normal human rhythm — slightly clustered
-    const delay = randDelay(baseMin, baseMax);
-    // Add small variance
-    return Math.round(delay * (0.9 + Math.random() * 0.2));
+    const r = Math.random();
+    if (r < 0.08) return rand(5000, 12000);   // "reading" pause
+    if (r < 0.12) return rand(10000, 25000);  // "distracted" pause
+    const d = rand(baseMin, baseMax);
+    return Math.round(d * (0.85 + Math.random() * 0.3));
   }
 
-  /**
-   * Human-like scrolling: small increments with pauses.
-   */
-  async function humanScroll(distance) {
-    const steps = Math.ceil(distance / 200);
+  async function humanScroll(dist) {
+    const steps = Math.ceil(dist / 200);
     for (let i = 0; i < Math.min(steps, 8); i++) {
       if (stopped || !running) break;
-      window.scrollBy(0, randDelay(150, 350));
-      await sleep(randDelay(200, 600));
+      window.scrollBy(0, rand(150, 350));
+      await sleep(rand(200, 600));
     }
   }
 
-  /**
-   * Human-like mouse movement simulation on an element.
-   * We can't actually move the mouse in userscript, but we can add delays
-   * that simulate "finding" the button and moving to it.
-   */
-  async function humanHoverDelay() {
-    // Simulate the time it takes to move mouse to a target
-    await sleep(randDelay(200, 800));
+  async function humanHover() {
+    await sleep(rand(150, 900));
   }
 
-  // ======================== LIMIT TRACKING (persistent learning) ========================
+  // ========================================================================
+  //  ADAPTIVE LEARNING ENGINE
+  // ========================================================================
 
-  function getAccountKey() {
+  function accountKey() {
     try {
-      const meta = document.querySelector('meta[property="og:url"]');
-      if (meta) {
-        const url = meta.getAttribute('content');
-        const match = url.match(/instagram\.com\/([^\/]+)/);
-        if (match) return `instatakker_limits_${match[1]}`;
+      const m = document.querySelector('meta[property="og:url"]');
+      if (m) {
+        const u = m.getAttribute('content');
+        const x = u.match(/instagram\.com\/([^\/\?#]+)/);
+        if (x) return `itk_${x[1]}`;
       }
-      // Also try from the page path
-      const path = window.location.pathname.split('/')[1];
-      if (path && path.length > 0 && path.length < 50) {
-        return `instatakker_limits_${path}`;
-      }
-    } catch(e) {}
-    return 'instatakker_limits_default';
+      const p = window.location.pathname.split('/')[1];
+      if (p && p.length < 50) return `itk_${p}`;
+    } catch (_) { /* skip */ }
+    return 'itk_default';
   }
+  const LKEY = accountKey();
 
-  const LIMITS_KEY = getAccountKey();
-
-  function loadLimits() {
+  function loadProfile() {
     try {
-      const raw = localStorage.getItem(LIMITS_KEY);
+      const raw = localStorage.getItem(LKEY);
       if (raw) {
-        const parsed = JSON.parse(raw);
-        log(`📂 Loaded learned limits for this account`);
-        return parsed;
+        const p = JSON.parse(raw);
+        log(`📂 Loaded profile — ${p.sessions} sessions, ${p.blocks} blocks`);
+        return p;
       }
-    } catch(e) {}
+    } catch (_) { /* ignore */ }
     return {
+      blocks: 0,
       blockHistory: [],
-      learnedHourlyCap: 200,
-      learnedPerPostCap: 150,
-      totalSessions: 0,
-      lastUpdated: null,
-      // Keep track of "safe" levels we've operated at
+      sessions: 0,
       maxSafeHourly: 0,
       maxSafePerPost: 0,
+      learnedHourlyCap: 200,
+      learnedPerPostCap: 150,
+      // fingerprint-like session tracking
+      screenW: screen.width,
+      screenH: screen.height,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      lastSession: null,
     };
   }
 
-  function saveLimits(limits) {
+  let profile = loadProfile();
+  profile.sessions++;
+
+  function saveProfile() {
     try {
-      limits.lastUpdated = Date.now();
-      localStorage.setItem(LIMITS_KEY, JSON.stringify(limits));
-    } catch(e) {}
+      profile.lastSession = Date.now();
+      localStorage.setItem(LKEY, JSON.stringify(profile));
+    } catch (_) { /* ignore */ }
   }
 
-  let limits = loadLimits();
-  limits.totalSessions++;
-
-  /**
-   * Record when we hit a rate limit / action block.
-   * We learn the ceiling and stay below it next time.
-   */
   function recordBlock(action) {
-    limits.blockHistory.push({
-      action: action,
-      hourlyCount: state.hourlyCount,
-      totalActions: state.liked,
-      timestamp: Date.now(),
+    profile.blocks++;
+    profile.blockHistory.push({
+      action, hourlyCount: st.hourlyCount, total: st.liked + st.unfollowed,
+      ts: Date.now(),
     });
+    if (profile.blockHistory.length > 20) profile.blockHistory = profile.blockHistory.slice(-20);
 
-    // Keep last 20 blocks
-    if (limits.blockHistory.length > 20) {
-      limits.blockHistory = limits.blockHistory.slice(-20);
+    const recent = profile.blockHistory.slice(-5);
+    if (recent.length >= 2) {
+      const avg = Math.round(recent.reduce((s, b) => s + b.hourlyCount, 0) / recent.length);
+      profile.learnedHourlyCap = Math.max(40, Math.round(avg * 0.65));  // more conservative margin
+      profile.learnedPerPostCap = Math.max(15, Math.round(profile.learnedHourlyCap / 4));
+      log(`🧠 Blocked at ${st.hourlyCount}/hr → learned cap: ${profile.learnedHourlyCap}/hr, ${profile.learnedPerPostCap}/post`);
     }
-
-    // Calculate learned limits based on block history
-    const recentBlocks = limits.blockHistory.slice(-5);
-    if (recentBlocks.length >= 2) {
-      const avgHourly = Math.round(
-        recentBlocks.reduce((s, b) => s + b.hourlyCount, 0) / recentBlocks.length
-      );
-
-      // Set learned cap at 70% of average block point (safe margin)
-      limits.learnedHourlyCap = Math.max(40, Math.round(avgHourly * 0.7));
-      limits.learnedPerPostCap = Math.max(20, Math.round(limits.learnedHourlyCap / 3.5));
-
-      log(`🧠 Blocked at ${state.hourlyCount}/hr. New safe limits: ${limits.learnedHourlyCap}/hr, ${limits.learnedPerPostCap}/post`);
-    }
-
-    saveLimits(limits);
+    saveProfile();
   }
 
-  /**
-   * Track that we successfully operated at a certain level without getting blocked.
-   * This helps us know our actual safe zone.
-   */
-  function recordSafeOperation() {
-    if (state.hourlyCount > limits.maxSafeHourly) {
-      limits.maxSafeHourly = state.hourlyCount;
-      limits.maxSafePerPost = Math.max(limits.maxSafePerPost,
-        Math.round(state.commentsLiked / Math.max(1, state.postsEngaged)));
-      saveLimits(limits);
+  function recordSafe() {
+    if (st.hourlyCount > profile.maxSafeHourly) {
+      profile.maxSafeHourly = st.hourlyCount;
+      const avg = st.postsEngaged > 0 ? Math.round(st.commentsLiked / st.postsEngaged) : 0;
+      profile.maxSafePerPost = Math.max(profile.maxSafePerPost, avg);
+      saveProfile();
     }
   }
 
-  function getSafeLimits() {
-    if (limits.blockHistory.length >= 2) {
+  function safeLimits() {
+    if (profile.blocks >= 2) {
       return {
-        hourlyCap: Math.min(config.like.hourlyLimit, Math.max(limits.maxSafeHourly + 10, limits.learnedHourlyCap)),
-        perPostCap: Math.min(config.like.maxCommentsPerPost, Math.max(limits.maxSafePerPost + 5, limits.learnedPerPostCap)),
+        hourly: Math.min(cfg.like.hourlyLimit, Math.max(
+          profile.maxSafeHourly + 8,
+          profile.learnedHourlyCap
+        )),
+        perPost: Math.min(cfg.like.maxCommentsPerPost, Math.max(
+          profile.maxSafePerPost + 3,
+          profile.learnedPerPostCap
+        )),
       };
     }
-    // No blocks yet — use configured limits but cap at a conservative level for new accounts
-    return {
-      hourlyCap: Math.min(config.like.hourlyLimit, 100),
-      perPostCap: Math.min(config.like.maxCommentsPerPost, 50),
+    // new account — conservative
+    return { hourly: Math.min(cfg.like.hourlyLimit, 80), perPost: Math.min(cfg.like.maxCommentsPerPost, 40) };
+  }
+
+  // ========================================================================
+  //  USER AGENT & FINGERPRINT SPOOFING (session-level)
+  // ========================================================================
+
+  /**
+   * Generate a session fingerprint hash used to seed random-like behavior.
+   * Every session gets a slightly different "personality".
+   */
+  function sessionFingerprint() {
+    const seed = [
+      Date.now() & 0xFFFF,
+      Math.random() * 1000,
+      profile.sessions,
+      screen.width,
+      screen.height,
+      navigator.hardwareConcurrency || 4,
+    ].join('|');
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) {
+      h = ((h << 5) - h) + seed.charCodeAt(i);
+      h |= 0;
+    }
+    return Math.abs(h);
+  }
+
+  const FP = sessionFingerprint();
+
+  /**
+   * Seeded pseudo-random number generator (mulberry32).
+   * Each session gets deterministic but unique behavior patterns.
+   */
+  function seededRand() {
+    let s = FP + 1;
+    return function() {
+      s |= 0;
+      s = s + 0x6D2B79F5 | 0;
+      let t = Math.imul(s ^ s >>> 15, 1 | s);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
     };
   }
+  const srand = seededRand();
 
-  // ======================== UNFOLLOW MODE ========================
+  /**
+   * Session-level behavioral parameters (rotated each session).
+   * Makes the bot behave differently every time — harder to fingerprint.
+   */
+  const BEHAVIOR = {
+    scrollSpeed: 150 + Math.floor(srand() * 300),       // 150-450 px per step
+    pauseChance: 0.05 + srand() * 0.12,                  // 5-17% chance of extra pause
+    distractionChance: 0.02 + srand() * 0.08,            // 2-10% chance of long pause
+    microPauseMin: 50 + Math.floor(srand() * 150),       // 50-200ms
+    microPauseMax: 150 + Math.floor(srand() * 300),      // 150-450ms
+    burstSize: 2 + Math.floor(srand() * 5),              // 2-6 actions before micro-break
+    burstBreak: 2000 + Math.floor(srand() * 6000),       // 2-8s break after burst
+    clickJitter: Math.floor(srand() * 6),                // 0-5 extra ms jitter
+  };
 
-  function getFollowingButtons() {
-    const dialog = document.querySelector('div[role="dialog"]');
-    if (!dialog) return [];
-    return [...dialog.querySelectorAll('button')].filter(b => {
-      if (!b.offsetParent) return false;
-      return (b.innerText || '').trim() === 'Following';
-    });
-  }
-
-  function clickUnfollowConfirm() {
-    const btn = [...document.querySelectorAll('button')].find(b => {
-      if (!b.offsetParent) return false;
-      return (b.innerText || '').trim() === 'Unfollow';
-    });
-    if (btn) { btn.click(); return true; }
-    return false;
-  }
-
-  function scrollFollowingList() {
-    const dialog = document.querySelector('div[role="dialog"]');
-    if (!dialog) return false;
-    const scrollables = [...dialog.querySelectorAll('div')].filter(d => {
-      try { return d.scrollHeight > d.clientHeight + 30; } catch(e) { return false; }
-    });
-    if (scrollables.length > 0) {
-      scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight)[0].scrollTop += 800;
-      return true;
+  /**
+   * HUMAN-like delay with session-level variance.
+   */
+  function adaptiveDelay(baseMin, baseMax) {
+    const r = Math.random();
+    if (r < BEHAVIOR.pauseChance) {
+      return rand(baseMin + 2000, baseMax + 5000);           // "reading" pause
     }
-    return false;
+    if (r < BEHAVIOR.pauseChance + BEHAVIOR.distractionChance) {
+      return rand(8000, 22000);                               // "distracted" pause
+    }
+    // Session-specific speed bias
+    const bias = 0.85 + srand() * 0.3;
+    return Math.round(rand(baseMin, baseMax) * bias);
   }
 
-  // ======================== LIKE MODE (Post + Comments) ========================
+  /**
+   * Micro-actions within a burst — fast but varied.
+   */
+  async function microAction() {
+    await sleep(rand(BEHAVIOR.microPauseMin, BEHAVIOR.microPauseMax));
+  }
 
-  function likeCurrentPost() {
-    const likeSvg = document.querySelector('svg[aria-label="Like"]');
-    if (!likeSvg) return false;
-    const clickable = likeSvg.closest('button') || likeSvg.closest('span[role="button"]') || likeSvg.closest('div[role="button"]') || likeSvg.parentElement;
-    if (!clickable) return false;
-    clickable.click();
+  let _burstCounter = 0;
+
+  async function burstCheck() {
+    _burstCounter++;
+    if (_burstCounter >= BEHAVIOR.burstSize) {
+      _burstCounter = 0;
+      await sleep(rand(
+        BEHAVIOR.burstBreak,
+        BEHAVIOR.burstBreak + 4000
+      ));
+    }
+  }
+
+  // ========================================================================
+  //  DOM HELPERS — Instagram-specific
+  // ========================================================================
+
+  /** Get the currently visible article elements in the feed */
+  function feedArticles() {
+    return [...document.querySelectorAll('article')].filter(a => {
+      const rect = a.getBoundingClientRect();
+      return rect.bottom > 0 && rect.top < window.innerHeight;
+    });
+  }
+
+  /** Find a "Like" heart SVG inside a container that is NOT already liked */
+  function findLikeButton(container = document) {
+    // aria-label="Like" (not "Unlike")
+    const svgs = [...container.querySelectorAll('svg[aria-label="Like"]')];
+    // Filter out comment hearts — we want the post heart
+    // Post heart is usually inside the main article action bar
+    for (const svg of svgs) {
+      const section = svg.closest('section');
+      if (section && section.closest('article')) return svg;
+    }
+    return svgs.find(s => s.closest('article')) || svgs[0] || null;
+  }
+
+  /** Click a like button element */
+  function clickLike(el) {
+    if (!el) return false;
+    const btn = el.closest('button') || el.closest('[role="button"]') || el.parentElement;
+    if (!btn) return false;
+    btn.click();
     return true;
   }
 
-  function clickLoadMoreComments() {
-    const loadMoreSvg = document.querySelector('svg[aria-label="Load more comments"]');
-    if (!loadMoreSvg) return false;
-
-    const clickable = loadMoreSvg.closest('button') ||
-                      loadMoreSvg.closest('div[role="button"]') ||
-                      loadMoreSvg.closest('span') ||
-                      loadMoreSvg.parentElement;
-    if (!clickable) return false;
-
-    clickable.click();
+  /** Click "Load more comments" button */
+  function clickLoadMore() {
+    const svg = document.querySelector('svg[aria-label="Load more comments"]');
+    if (!svg) return false;
+    const btn = svg.closest('button') || svg.closest('[role="button"]') || svg.parentElement;
+    if (!btn) return false;
+    btn.click();
     return true;
   }
 
-  function getUnlikeCommentButtons() {
-    const allCommentLikeSvgs = [...document.querySelectorAll('ul ul svg[aria-label="Like"]')];
+  /** Get all comment Like buttons that are currently unliked */
+  function unlikedCommentButtons() {
     const seen = new Set();
-    return allCommentLikeSvgs.filter(svg => {
+    const all = [...document.querySelectorAll('ul ul svg[aria-label="Like"]')];
+    return all.filter(svg => {
       const li = svg.closest('li');
       if (!li || seen.has(li)) return false;
       seen.add(li);
@@ -295,621 +337,734 @@
     });
   }
 
-  function likeComment(svg) {
-    const clickable = svg.closest('button') || svg.closest('span[role="button"]') || svg.parentElement;
-    if (!clickable) return false;
-    clickable.click();
+  /** Click a comment like button */
+  function clickCommentLike(svg) {
+    const btn = svg.closest('button') || svg.closest('[role="button"]') || svg.parentElement;
+    if (!btn) return false;
+    btn.click();
     return true;
   }
 
-  function scrollCommentSection() {
-    const commentAreas = [...document.querySelectorAll('ul')].filter(ul => {
-      try { return ul.scrollHeight > ul.clientHeight + 20; } catch(e) { return false; }
-    });
-    if (commentAreas.length > 0) {
-      commentAreas[0].scrollTop = commentAreas[0].scrollHeight;
-      return true;
-    }
-
+  /** Scroll the comments dialog/list */
+  function scrollComments() {
+    // Try scrolling the dialog
     const dialog = document.querySelector('div[role="dialog"]');
     if (dialog) {
       const scrollables = [...dialog.querySelectorAll('div')].filter(d => {
-        try { return d.scrollHeight > d.clientHeight + 30; } catch(e) { return false; }
+        try { return d.scrollHeight > d.clientHeight + 30; } catch(_) { return false; }
       });
-      if (scrollables.length > 0) {
+      if (scrollables.length) {
         scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight)[0].scrollTop += 500;
         return true;
       }
     }
+    // Try direct comment list
+    const uls = [...document.querySelectorAll('ul')].filter(ul => {
+      try { return ul.scrollHeight > ul.clientHeight + 20; } catch(_) { return false; }
+    });
+    if (uls.length) { uls[0].scrollTop = uls[0].scrollHeight; return true; }
     return false;
   }
 
-  function isInPostView() {
+  /** Is the post dialog open? */
+  function inPostView() {
     return !!document.querySelector('div[role="dialog"] article');
   }
 
+  /** Click the "Next" arrow to go to the next post */
+  function goNextPost() {
+    try {
+      // Primary: SVG with aria-label="Next" → Instagram's next post arrow
+      const nextSvg = document.querySelector('svg[aria-label="Next"]');
+      if (nextSvg) {
+        const btn = nextSvg.closest('button');
+        if (btn) { btn.click(); return true; }
+      }
+      // Fallback: look for the right-arrow button inside the dialog
+      const dialog = document.querySelector('div[role="dialog"]');
+      if (dialog) {
+        const arrows = [...dialog.querySelectorAll('button')].filter(b => {
+          return b.querySelector('svg[aria-label="Next"]') ||
+                 (b.innerHTML.includes('Next') && b.offsetParent !== null);
+        });
+        if (arrows.length) { arrows[0].click(); return true; }
+      }
+    } catch(_) { /* ignore */ }
+    return false;
+  }
+
+  /** Close the current post dialog */
+  function closePost() {
+    const closeSvg = document.querySelector('svg[aria-label="Close"]');
+    if (closeSvg) {
+      const btn = closeSvg.closest('button') || closeSvg.parentElement;
+      if (btn) { btn.click(); return true; }
+    }
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape', bubbles: true, cancelable: true,
+    }));
+    return true;
+  }
+
+  // ========================================================================
+  //  UNFOLLOW ENGINE
+  // ========================================================================
+
+  function getFollowingBtns() {
+    const dialog = document.querySelector('div[role="dialog"]');
+    if (!dialog) return [];
+    return [...dialog.querySelectorAll('button')].filter(b => {
+      if (!b.offsetParent) return false;
+      return (b.textContent || '').trim() === 'Following';
+    });
+  }
+
+  function clickUnfollowConfirm() {
+    const btn = [...document.querySelectorAll('button')].find(b => {
+      if (!b.offsetParent) return false;
+      return (b.textContent || '').trim() === 'Unfollow';
+    });
+    if (btn) { btn.click(); return true; }
+    return false;
+  }
+
+  function scrollFollowing() {
+    const dialog = document.querySelector('div[role="dialog"]');
+    if (!dialog) return false;
+    const scrollables = [...dialog.querySelectorAll('div')].filter(d => {
+      try { return d.scrollHeight > d.clientHeight + 30; } catch(_) { return false; }
+    });
+    if (scrollables.length) {
+      scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight)[0].scrollTop += 800;
+      return true;
+    }
+    return false;
+  }
+
+  // ========================================================================
+  //  LIKE ENGINE — FEED MODE (processes all visible posts)
+  // ========================================================================
+
   /**
-   * Like EVERYTHING — all comments on the post.
-   * Keeps clicking "Load more comments" until no more load.
-   * Keeps scrolling until no more comments appear.
+   * Like ALL comments on the current post dialog.
+   * Returns number of comments liked.
    */
-  async function likeAllComments(logArea, statusEl) {
-    let commentsLiked = 0;
-    let roundsWithoutNewComments = 0;
-    let previousCommentCount = 0;
-    const maxRounds = 100; // safety cap
-    const safeLimits = getSafeLimits();
+  async function likeAllComments(logEl) {
+    let liked = 0;
+    let roundsWithNothing = 0;
+    let prevCount = 0;
+    const lim = safeLimits();
 
-    for (let round = 0; round < maxRounds; round++) {
+    for (let r = 0; r < 80; r++) {
       if (stopped || !running) break;
-
-      // Check hourly limit
-      if (state.hourlyCount >= safeLimits.hourlyCap) {
-        if (statusEl) {
-          statusEl.textContent = `⏳ Hit hourly cap (${state.hourlyCount})`;
-          statusEl.style.background = '#ff6b9d22';
-        }
-        recordBlock('hourly_cap');
+      if (st.hourlyCount >= lim.hourly) {
+        recordBlock('hourly_cap_comments');
         break;
       }
 
-      // Step 1: Click "Load more comments" if visible
-      const loadClicked = clickLoadMoreComments();
-      if (loadClicked) {
-        await sleep(randDelay(1500, 3000));
-        if (logArea) logArea.textContent = `📄 Loading more comments... (${commentsLiked} liked so far)`;
+      // 1. Load more comments
+      const loaded = clickLoadMore();
+      if (loaded) {
+        await sleep(rand(1200, 2500));
+        if (logEl) logEl.textContent = `📄 Loading more comments... (${liked} liked)`;
       }
 
-      // Step 2: Scroll comments section
-      scrollCommentSection();
-      await sleep(randDelay(1000, 2000));
+      // 2. Scroll
+      scrollComments();
+      await sleep(rand(800, 1800));
 
-      // Step 3: Find and like ALL unliked comments
-      const commentSvgs = getUnlikeCommentButtons();
-
-      if (commentSvgs.length > 0) {
-        roundsWithoutNewComments = 0;
-
-        for (const svg of commentSvgs) {
+      // 3. Like unliked comments
+      const btns = unlikedCommentButtons();
+      if (btns.length > 0) {
+        roundsWithNothing = 0;
+        for (const svg of btns) {
           if (stopped || !running) break;
           if (!document.contains(svg)) continue;
-
-          // Check hourly
-          if (state.hourlyCount >= safeLimits.hourlyCap) {
+          if (st.hourlyCount >= lim.hourly) {
             recordBlock('hourly_cap_mid_comment');
             break;
           }
 
-          // Human-like hover before clicking
-          await humanHoverDelay();
+          await humanHover();
+          await microAction();
 
-          const success = likeComment(svg);
-          if (success) {
-            commentsLiked++;
-            state.liked++;
-            state.hourlyCount++;
-            state.commentsLiked++;
+          if (clickCommentLike(svg)) {
+            liked++;
+            st.liked++;
+            st.hourlyCount++;
+            st.commentsLiked++;
+            if (logEl) logEl.textContent = `💬 Liked ${liked} comments (total: ${st.liked})`;
 
-            if (logArea) {
-              logArea.textContent = `💬 Liked ${commentsLiked} comments (total: ${state.liked})`;
-            }
-            if (statusEl) {
-              statusEl.textContent = `❤️${state.liked} | 💬${commentsLiked}`;
-            }
-
-            // Human-like delay between comment likes
-            // Sometimes faster, sometimes slower — like a real person
-            await sleep(humanDelay(
-              config.like.minCommentDelay,
-              config.like.maxCommentDelay
+            // Use adaptive human delay
+            await sleep(adaptiveDelay(
+              cfg.like.minCommentDelay,
+              cfg.like.maxCommentDelay
             ));
           } else {
-            state.consecutiveErrors++;
-            if (state.consecutiveErrors > 5) {
-              log('Too many errors — cooling down');
+            st.consecutiveErrors++;
+            if (st.consecutiveErrors > 5) {
               await sleep(10000);
-              state.consecutiveErrors = 0;
+              st.consecutiveErrors = 0;
             }
             await sleep(500);
           }
         }
       } else {
-        // No comments to like right now
-        roundsWithoutNewComments++;
-
-        // Check if new comments loaded
-        if (roundsWithoutNewComments >= 3 && !loadClicked) {
-          // No new comments and no load button — we're done
-          log(`✅ Liked all ${commentsLiked} comments on this post`);
+        roundsWithNothing++;
+        if (roundsWithNothing >= 3 && !loaded) {
+          log(`✅ All ${liked} comments liked on this post`);
           break;
         }
-
-        // Wait for more comments to potentially load
-        await sleep(randDelay(2000, 4000));
-      }
-
-      // Track progress
-      if (round % 5 === 0) {
-        recordSafeOperation();
+        await sleep(rand(1500, 3500));
       }
     }
 
-    state.postsEngaged++;
-    return commentsLiked;
+    st.postsEngaged++;
+    return liked;
   }
 
-  // ======================== MAIN ENGINE ========================
+  /**
+   * Process one post: like it + like all its comments.
+   * Returns { liked, comments }.
+   */
+  async function processPost(logEl, statusEl) {
+    if (stopped || !running) return { liked: false, comments: 0 };
 
-  async function instatakkerEngine() {
-    state.startTime = state.startTime || Date.now();
-    const logArea = document.getElementById('itk-log');
-    const statusEl = document.getElementById('itk-status');
-    const safeLimits = getSafeLimits();
+    // ---- Like the post ----
+    const likeSvg = findLikeButton();
+    const postLiked = likeSvg && clickLike(likeSvg);
 
-    // Show learned limits at start
-    if (limits.blockHistory.length >= 2) {
-      if (logArea) {
-        logArea.textContent = `🧠 Learned: ~${safeLimits.hourlyCap}/hr | Max safe: ${limits.maxSafeHourly}/hr`;
-      }
+    if (postLiked) {
+      st.liked++;
+      st.hourlyCount++;
+      st.postsEngaged++;
+      if (logEl) logEl.textContent = `❤️ Liked post ${st.postsEngaged}`;
+      if (statusEl) statusEl.textContent = `❤️${st.liked}`;
+      log(`Liked post #${st.postsEngaged}`);
+
+      // Human pause — "look at the post"
+      await sleep(adaptiveDelay(3000, 8000));
     } else {
-      if (logArea) {
-        logArea.textContent = `🆕 New account — starting conservative (${safeLimits.hourlyCap}/hr)`;
-      }
+      if (logEl) logEl.textContent = `📌 Already liked (${st.liked} total)`;
     }
 
+    // ---- Like all comments ----
+    if (logEl) logEl.textContent = `💬 Liking comments...`;
+    const comments = await likeAllComments(logEl);
+
+    return { liked: postLiked, comments };
+  }
+
+  /**
+   * Find the next unprocessed post in the feed and open it.
+   * Works on the main feed (home, hashtag, profile).
+   * Returns true if a post was opened.
+   */
+  async function openNextPost(logEl) {
+    if (stopped || !running) return false;
+
+    // Strategy: look for post links that haven't been processed
+    // Instagram uses anchor tags inside articles pointing to /p/...
+    let posts = [
+      ...document.querySelectorAll('article a[href*="/p/"], article a[href*="/reel/"]'),
+    ].filter(a => {
+      // Must be visible
+      const r = a.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 &&
+             r.bottom > -100 && r.top < window.innerHeight + 100;
+    });
+
+    // Remove duplicates
+    const seen = new Set();
+    posts = posts.filter(a => {
+      const href = a.getAttribute('href');
+      if (seen.has(href)) return false;
+      seen.add(href);
+      return true;
+    });
+
+    // If no posts in view, scroll a bit
+    if (posts.length === 0) {
+      await humanScroll(600);
+      await sleep(rand(1000, 2000));
+      posts = [...document.querySelectorAll('article a[href*="/p/"], article a[href*="/reel/"]')]
+        .filter(a => {
+          const r = a.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 &&
+                 r.bottom > -100 && r.top < window.innerHeight + 100;
+        });
+      const seen2 = new Set();
+      posts = posts.filter(a => {
+        const href = a.getAttribute('href');
+        if (seen2.has(href)) return false;
+        seen2.add(href);
+        return true;
+      });
+    }
+
+    if (posts.length === 0) {
+      if (logEl) logEl.textContent = `📭 No posts visible — scrolling...`;
+      await humanScroll(window.innerHeight);
+      await sleep(rand(1500, 3000));
+      return false;
+    }
+
+    // Pick a post — not always the first one (human-like)
+    const idx = Math.floor(srand() * Math.min(posts.length, 3));
+    const post = posts[idx] || posts[0];
+
+    if (logEl) logEl.textContent = `📱 Opening post...`;
+    post.click();
+    await sleep(rand(2000, 3500));
+    return true;
+  }
+
+  /**
+   * Navigate to the next post using Instagram's built-in arrow.
+   * This works when already inside a post dialog.
+   */
+  async function nextPostViaArrow(logEl) {
+    if (goNextPost()) {
+      await sleep(rand(2000, 3500));
+      return true;
+    }
+
+    // If no next arrow, close and scroll to next
+    if (logEl) logEl.textContent = `➡️ No next arrow — closing post...`;
+    closePost();
+    await sleep(rand(1500, 2500));
+    await humanScroll(rand(500, 1200));
+    await sleep(rand(1500, 3000));
+    return false;
+  }
+
+  // ========================================================================
+  //  MAIN ENGINE
+  // ========================================================================
+
+  async function engine() {
+    st.startTime = st.startTime || Date.now();
+    const logEl  = document.getElementById('itk-log');
+    const stEl   = document.getElementById('itk-status');
+    const lim    = safeLimits();
+    const learned = profile.blocks >= 2;
+
+    // Show session personality
+    if (logEl) {
+      const personality = ['casual', 'focused', 'browsing', 'scrolling', 'engaged'][FP % 5];
+      logEl.textContent = learned
+        ? `🧠 ${profile.sessions} sessions · ${lim.hourly}/hr learned · ${personality} mode`
+        : `🆕 Building profile · conservative (${lim.hourly}/hr) · ${personality} mode`;
+    }
+    log(`Session fingerprint: ${FP} | Behavior: ${JSON.stringify(BEHAVIOR)}`);
+
     while (running && !stopped) {
-      // Hourly limit reset
-      if (Date.now() - state.hourlyReset > 3600000) {
-        state.hourlyCount = 0;
-        state.hourlyReset = Date.now();
+      // -------- Hourly reset --------
+      if (Date.now() - st.hourlyReset > 3600000) {
+        st.hourlyCount = 0;
+        st.hourlyReset = Date.now();
         log('⏰ Hourly counter reset');
       }
 
-      if (state.hourlyCount >= safeLimits.hourlyCap) {
-        const waitMs = 3600000 - (Date.now() - state.hourlyReset);
-        const waitMin = Math.ceil(waitMs / 60000);
-        if (logArea) logArea.textContent = `⏳ Hit cap (${state.hourlyCount}) — waiting ${waitMin}min`;
-        if (statusEl) {
-          statusEl.textContent = `⏳ Waiting ${waitMin}min`;
-          statusEl.style.background = '#ff6b9d22';
-        }
+      // -------- Cap check --------
+      const cap = mode === 'unfollow' ? cfg.unfollow.hourlyLimit : lim.hourly;
+      if (st.hourlyCount >= cap) {
+        const wait = 3600000 - (Date.now() - st.hourlyReset);
+        const mins = Math.ceil(wait / 60000);
+        if (logEl) logEl.textContent = `⏳ Hit cap (${st.hourlyCount}) — wait ${mins}min`;
+        if (stEl) { stEl.textContent = `⏳ ${mins}min`; stEl.style.background = '#ff6b9d22'; }
         recordBlock('hourly_cap_reached');
 
-        // Instead of waiting the full hour, do a human-like "come back later" pause
-        await sleep(randDelay(300000, 600000)); // 5-10 min
-        // Then check if we're still over the hourly limit
-        if (state.hourlyCount >= safeLimits.hourlyCap) {
-          await sleep(Math.min(waitMs + 5000, 3600000));
+        // Human-like 5-10 min break, then retry
+        await sleep(rand(300000, 600000));
+        if (st.hourlyCount >= cap) {
+          await sleep(Math.min(wait + 5000, 3600000));
         }
-
-        state.hourlyCount = 0;
-        state.hourlyReset = Date.now();
-
-        if (statusEl) {
-          statusEl.style.background = '';
-          statusEl.style.border = '';
-        }
+        st.hourlyCount = 0;
+        st.hourlyReset = Date.now();
+        if (stEl) { stEl.style.background = ''; }
         continue;
       }
 
-      const currentCount = mode === 'unfollow' ? state.unfollowed : state.liked;
-      const maxLimit = mode === 'unfollow' ? config.unfollow.maxUnfollows : config.like.maxLikes;
-
-      if (currentCount >= maxLimit) {
-        if (logArea) logArea.textContent = `✅ ${mode === 'unfollow' ? 'Unfollowed' : 'Liked'} ${currentCount}`;
+      const count  = mode === 'unfollow' ? st.unfollowed : st.liked;
+      const maxVal = mode === 'unfollow' ? cfg.unfollow.maxUnfollows : cfg.like.maxLikes;
+      if (count >= maxVal) {
+        if (logEl) logEl.textContent = `✅ ${mode === 'unfollow' ? 'Unfollowed' : 'Liked'} ${count}`;
+        updateUI();
         break;
       }
 
+      // ===================== UNFOLLOW =====================
       if (mode === 'unfollow') {
-        // ===================== UNFOLLOW =====================
         if (!document.querySelector('div[role="dialog"]')) {
-          if (logArea) logArea.textContent = '⚠️ Open Following list';
+          if (logEl) logEl.textContent = '⚠️ Open the Following list first';
           await sleep(2000);
           continue;
         }
 
-        const buttons = getFollowingButtons();
-        log(`Found ${buttons.length} Following buttons`);
-
-        if (buttons.length === 0) {
-          state.emptyRounds++;
-          if (state.emptyRounds >= config.unfollow.emptyRoundsBeforeStop) {
-            if (logArea) logArea.textContent = `🏁 Done (${state.unfollowed} unfollowed)`;
+        const btns = getFollowingBtns();
+        if (btns.length === 0) {
+          st.emptyRounds++;
+          if (st.emptyRounds >= cfg.unfollow.emptyRoundsBeforeStop) {
+            if (logEl) logEl.textContent = `🏁 Done (${st.unfollowed} unfollowed)`;
             break;
           }
-          if (logArea) logArea.textContent = `⚠️ No Following buttons (${state.emptyRounds}/${config.unfollow.emptyRoundsBeforeStop})`;
+          if (logEl) logEl.textContent = `⚠️ No Following buttons (${st.emptyRounds}/${cfg.unfollow.emptyRoundsBeforeStop})`;
         } else {
-          state.emptyRounds = 0;
-          state.consecutiveErrors = 0;
-          const btn = buttons[0];
+          st.emptyRounds = 0;
+          st.consecutiveErrors = 0;
+          const btn = btns[0];
           if (!document.contains(btn)) continue;
-          if ((btn.innerText || '').trim() !== 'Following') continue;
+          if ((btn.textContent || '').trim() !== 'Following') continue;
 
-          log(`Unfollowing #${state.unfollowed + 1}`);
-          if (logArea) logArea.textContent = `▶ Unfollowing #${state.unfollowed + 1}...`;
-
-          try { btn.scrollIntoView({ block: 'center' }); } catch(e) {}
-          await humanHoverDelay();
+          if (logEl) logEl.textContent = `▶ Unfollowing #${st.unfollowed + 1}...`;
+          try { btn.scrollIntoView({ block: 'center' }); } catch(_) {}
+          await humanHover();
+          await microAction();
           btn.click();
-          await sleep(randDelay(1200, 2500));
+          await sleep(rand(1200, 2500));
 
           const confirmed = clickUnfollowConfirm();
           if (confirmed) {
-            state.unfollowed++;
-            state.hourlyCount++;
+            st.unfollowed++;
+            st.hourlyCount++;
             updateUI();
-            if (statusEl) statusEl.textContent = `✅${state.unfollowed}`;
-            await sleep(humanDelay(config.unfollow.minDelay, config.unfollow.maxDelay));
+            if (stEl) stEl.textContent = `✅${st.unfollowed}`;
+            await sleep(adaptiveDelay(cfg.unfollow.minDelay, cfg.unfollow.maxDelay));
           } else {
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+            // Maybe already unfollowed, maybe UI changed
+            document.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'Escape', bubbles: true, cancelable: true,
+            }));
             await sleep(1500);
-            const stillThere = getFollowingButtons().some(b =>
-              document.contains(b) && b.innerText.trim() === 'Following' && b === btn
+            const still = getFollowingBtns().some(b =>
+              document.contains(b) && b.textContent.trim() === 'Following' && b === btn
             );
-            if (!stillThere) {
-              state.unfollowed++;
-              state.hourlyCount++;
+            if (!still) {
+              st.unfollowed++;
+              st.hourlyCount++;
               updateUI();
-              if (statusEl) statusEl.textContent = `✅${state.unfollowed}`;
-              await sleep(humanDelay(config.unfollow.minDelay, config.unfollow.maxDelay));
+              if (stEl) stEl.textContent = `✅${st.unfollowed}`;
+              await sleep(adaptiveDelay(cfg.unfollow.minDelay, cfg.unfollow.maxDelay));
             } else {
-              if (logArea) logArea.textContent = '⚠️ Cooling 30s...';
-              if (statusEl) {
-                statusEl.textContent = `⚠️`;
-                statusEl.style.background = '#ff6b9d22';
-              }
+              if (logEl) logEl.textContent = '⚠️ Cooling 30s...';
+              if (stEl) { stEl.textContent = `⚠️`; stEl.style.background = '#ff6b9d22'; }
               await sleep(30000);
-              if (statusEl) statusEl.style.background = '';
+              if (stEl) stEl.style.background = '';
             }
           }
+          await burstCheck();
         }
-        scrollFollowingList();
-        await sleep(config.unfollow.scrollWait);
+        scrollFollowing();
+        await sleep(cfg.unfollow.scrollWait);
+      }
 
-      } else {
-        // ===================== LIKE MODE =====================
-
-        // Rate limit check
-        const safe = getSafeLimits();
-        if (state.hourlyCount >= safe.hourlyCap * 0.9) {
-          // Getting close to limit — be more conservative
-          if (logArea) logArea.textContent = `⚠️ Approaching limit (${state.hourlyCount}/${safe.hourlyCap})`;
-          if (Math.random() < 0.3) {
-            // 30% chance to take a break
-            await sleep(randDelay(10000, 30000));
-          }
-        }
-
-        // Open a post if not already in one
-        if (!isInPostView()) {
-          const postLinks = [
-            document.querySelector('article a[href*="/p/"]'),
-            document.querySelector('article[role="presentation"] a'),
-          ].filter(Boolean);
-
-          if (postLinks.length > 0) {
-            // Randomly pick which post to open (not always the first)
-            const postLink = postLinks[Math.floor(Math.random() * postLinks.length)];
-            postLink.click();
-            await sleep(randDelay(2000, 3500));
-            if (logArea) logArea.textContent = `📱 Opened post (${state.liked} liked)`;
-          } else {
-            if (logArea) logArea.textContent = '⚠️ No posts found. Navigate to a hashtag or feed.';
-            await sleep(3000);
+      // ===================== LIKE =====================
+      else {
+        // --- Open a post if not already in one ---
+        if (!inPostView()) {
+          const opened = await openNextPost(logEl);
+          if (!opened) {
+            st.emptyRounds++;
+            if (st.emptyRounds >= cfg.like.emptyRoundsBeforeStop) {
+              if (logEl) logEl.textContent = `🏁 No more posts (${st.liked} liked)`;
+              break;
+            }
+            await sleep(rand(2000, 4000));
             continue;
           }
+          st.emptyRounds = 0;
         }
 
-        if (!isInPostView()) {
-          if (logArea) logArea.textContent = '⚠️ Click a post, then press Enter';
-          await sleep(2000);
-          continue;
-        }
+        // --- Process the post ---
+        const result = await processPost(logEl, stEl);
+        updateUI();
+        recordSafe();
 
-        // --- Step 1: Like the post ---
-        await humanHoverDelay();
-        const likedPost = likeCurrentPost();
-        if (likedPost) {
-          state.liked++;
-          state.hourlyCount++;
-          state.postsEngaged++;
-          if (logArea) logArea.textContent = `❤️ Liked post ${state.postsEngaged}`;
-          if (statusEl) statusEl.textContent = `❤️${state.liked}`;
-          log(`Liked post #${state.postsEngaged}`);
-
-          // Human pause after liking — "look" at the post
-          await sleep(humanDelay(3000, 8000));
-        } else {
-          if (logArea) logArea.textContent = `📌 Already liked (${state.liked} total)`;
-        }
-
-        // --- Step 2: Like ALL comments ---
-        if (logArea) logArea.textContent = `💬 Liking all comments...`;
-        const commentCount = await likeAllComments(logArea, statusEl);
-
-        if (commentCount > 0) {
-          log(`✅ Post ${state.postsEngaged}: liked all ${commentCount} comments`);
-          updateUI();
-        }
-
-        // --- Step 3: Close post and move to next ---
+        // --- Move to next post ---
         if (!stopped && running) {
-          if (logArea) logArea.textContent = `➡️ Moving to next post...`;
-          log('Closing post');
-
-          const closeSvg = document.querySelector('svg[aria-label="Close"]');
-          if (closeSvg) {
-            const closeBtn = closeSvg.closest('button') || closeSvg.parentElement;
-            if (closeBtn) closeBtn.click();
+          // Try the next arrow first
+          const moved = goNextPost();
+          if (moved) {
+            if (logEl) logEl.textContent = `➡️ Next post...`;
+            await sleep(rand(2000, 3500));
           } else {
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-          }
-          await sleep(randDelay(1500, 2500));
+            // Close and scroll
+            if (logEl) logEl.textContent = `➡️ Closing post, scrolling...`;
+            closePost();
+            await sleep(rand(1500, 2500));
+            await humanScroll(rand(500, 1200));
+            await sleep(rand(1500, 3000));
 
-          // Human scroll
-          await humanScroll(900);
-          await sleep(randDelay(1500, 3000));
-
-          // Update stats
-          recordSafeOperation();
-          const newsafe = getSafeLimits();
-          const avgComments = state.postsEngaged > 0
-            ? Math.round(state.commentsLiked / state.postsEngaged)
-            : 0;
-          if (logArea) {
-            logArea.textContent = `📊 ${state.liked} liked | ${state.hourlyCount}/${newsafe.hourlyCap}/hr | ~${avgComments} comments/post`;
+            // Update stats display
+            const avg = st.postsEngaged > 0 ? Math.round(st.commentsLiked / st.postsEngaged) : 0;
+            const nl = safeLimits();
+            if (logEl) {
+              logEl.textContent = `📊 ${st.liked} liked · ${st.hourlyCount}/${nl.hourly}/hr · ~${avg} comments/post`;
+            }
           }
+          await burstCheck();
         }
       }
     }
 
     running = false;
-    if (logArea) {
-      if (!logArea.textContent.includes('Done') && !logArea.textContent.includes('No more')) {
-        const count = mode === 'unfollow' ? state.unfollowed : state.liked;
-        const action = mode === 'unfollow' ? 'unfollowed' : 'liked';
-        logArea.textContent = `■ Stopped (${count} ${action})`;
-      }
+    const finalCount = mode === 'unfollow' ? st.unfollowed : st.liked;
+    const action     = mode === 'unfollow' ? 'unfollowed' : 'liked';
+    if (logEl && !logEl.textContent.includes('Done') && !logEl.textContent.includes('No more')) {
+      logEl.textContent = `■ Stopped (${finalCount} ${action})`;
     }
-    if (statusEl) {
-      statusEl.textContent = `■`;
-      statusEl.style.background = '';
-      statusEl.style.border = '';
-    }
+    if (stEl) { stEl.textContent = `■`; stEl.style.background = ''; }
 
-    saveLimits(limits);
-    log(`Engine stopped. Learning data saved. Total sessions: ${limits.totalSessions}`);
+    saveProfile();
+    profile.sessions++;
+    saveProfile();
+    log(`Engine stopped. Profile saved. Total sessions: ${profile.sessions}`);
   }
 
-  // ======================== UI ========================
+  // ========================================================================
+  //  UI — Clean inline panel (no popup, left side)
+  // ========================================================================
 
   function updateUI() {
-    const countEl = document.getElementById('itk-count');
-    const progressEl = document.getElementById('itk-progress');
-    const barEl = document.getElementById('itk-bar');
-    const hourlyEl = document.getElementById('itk-hourly');
-    const perPostEl = document.getElementById('itk-perpost');
-    const engagedEl = document.getElementById('itk-engaged');
+    const el = id => document.getElementById(id);
+    const count = mode === 'unfollow' ? st.unfollowed : st.liked;
+    const max   = mode === 'unfollow' ? cfg.unfollow.maxUnfollows : cfg.like.maxLikes;
+    const safe  = safeLimits();
 
-    const currentCount = mode === 'unfollow' ? state.unfollowed : state.liked;
-    const maxCount = mode === 'unfollow' ? config.unfollow.maxUnfollows : config.like.maxLikes;
-
-    if (countEl) countEl.textContent = currentCount;
-    if (progressEl) progressEl.textContent = `${currentCount} / ${maxCount}`;
-    if (barEl) barEl.style.width = `${(currentCount / maxCount) * 100}%`;
-    if (hourlyEl) hourlyEl.textContent = `${state.hourlyCount} / ${mode === 'unfollow' ? config.unfollow.hourlyLimit : getSafeLimits().hourlyCap}`;
+    if (el('itk-count'))    el('itk-count').textContent = count;
+    if (el('itk-progress')) el('itk-progress').textContent = `${count} / ${max}`;
+    if (el('itk-bar'))      el('itk-bar').style.width = `${(count / Math.max(1, max)) * 100}%`;
+    if (el('itk-hourly'))   el('itk-hourly').textContent =
+      `${st.hourlyCount} / ${mode === 'unfollow' ? cfg.unfollow.hourlyLimit : safe.hourly}`;
 
     if (mode === 'like') {
-      if (perPostEl) {
-        const avg = state.postsEngaged > 0 ? Math.round(state.commentsLiked / state.postsEngaged) : 0;
-        perPostEl.textContent = `${avg} avg`;
-      }
-      if (engagedEl) engagedEl.textContent = state.postsEngaged;
+      const avg = st.postsEngaged > 0 ? Math.round(st.commentsLiked / st.postsEngaged) : 0;
+      if (el('itk-perpost')) el('itk-perpost').textContent = `${avg} avg`;
+      if (el('itk-engaged')) el('itk-engaged').textContent = st.postsEngaged;
     }
   }
 
   function createPanel() {
-    const existing = document.getElementById('instatakker-panel');
-    if (existing) existing.remove();
+    const old = document.getElementById('itk-panel');
+    if (old) old.remove();
 
     try {
-      const saved = sessionStorage.getItem('instatakker_state');
-      if (saved) state = { ...state, ...JSON.parse(saved) };
-    } catch(e) {}
+      const saved = sessionStorage.getItem('itk_state');
+      if (saved) {
+        const s = JSON.parse(saved);
+        Object.assign(st, s);
+      }
+    } catch(_) {}
 
-    const avgComments = state.postsEngaged > 0 ? Math.round(state.commentsLiked / state.postsEngaged) : 0;
-    const safe = getSafeLimits();
-    const hasLearned = limits.blockHistory.length >= 2;
+    const avg  = st.postsEngaged > 0 ? Math.round(st.commentsLiked / st.postsEngaged) : 0;
+    const safe = safeLimits();
+    const learned = profile.blocks >= 2;
+    const personality = ['casual', 'focused', 'browsing', 'scrolling', 'engaged'][FP % 5];
 
     const panel = document.createElement('div');
-    panel.id = 'instatakker-panel';
+    panel.id = 'itk-panel';
     panel.innerHTML = `
-      <div style="position:fixed;top:20px;right:20px;z-index:999999;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;width:370px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.4);background:#0f0f1a;color:#e0e0e0;padding:16px;user-select:none;border:1px solid rgba(255,0,80,0.25);">
+<div style="
+  position:fixed; left:16px; top:80px; z-index:999999;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  width:340px;
+  border-radius:10px;
+  box-shadow:0 6px 24px rgba(0,0,0,0.35);
+  background:#0d0d18;
+  color:#ddd;
+  padding:12px 14px;
+  user-select:none;
+  border:1px solid rgba(255,0,80,0.18);
+  font-size:13px;
+  line-height:1.4;
+">
 
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;cursor:move;" id="itk-drag">
-          <div style="display:flex;align-items:center;gap:8px;">
-            <span style="font-size:16px;">⏹</span>
-            <h2 style="margin:0;font-size:17px;font-weight:700;color:#ff0050;letter-spacing:-0.3px;">Instatakker</h2>
-          </div>
-          <span style="font-size:10px;opacity:0.4;background:#1a1a2e;padding:2px 6px;border-radius:4px;">v${VERSION}</span>
-        </div>
+  <!-- Header -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;cursor:move;" id="itk-drag">
+    <div style="display:flex;align-items:center;gap:6px;">
+      <span style="font-size:15px;">⏹</span>
+      <strong style="font-size:15px;color:#ff0050;">Instatakker</strong>
+    </div>
+    <span style="font-size:9px;opacity:0.35;background:#1a1a2e;padding:1px 5px;border-radius:3px;">v${VERSION}</span>
+  </div>
 
-        <div style="display:flex;gap:4px;margin-bottom:10px;background:#1a1a2e;border-radius:8px;padding:3px;">
-          <button id="itk-mode-unfollow" style="flex:1;padding:6px 10px;border:none;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;background:#ff0050;color:white;transition:all 0.2s;">Unfollow</button>
-          <button id="itk-mode-like" style="flex:1;padding:6px 10px;border:none;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;background:transparent;color:#888;transition:all 0.2s;">Like</button>
-        </div>
+  <!-- Session personality -->
+  <div style="font-size:9px;color:#888;margin-bottom:6px;">
+    🧬 ${personality} · ${profile.sessions} sessions
+    ${learned ? `· max ${profile.maxSafeHourly}/hr safe` : '· building profile'}
+  </div>
 
-        ${hasLearned ? `
-        <div style="font-size:10px;color:#ff6b9d;background:#ff6b9d10;padding:4px 8px;border-radius:4px;margin-bottom:8px;border:1px solid #ff6b9d25;display:flex;justify-content:space-between;">
-          <span>🧠 ${limits.totalSessions} sessions</span>
-          <span>max ${limits.maxSafeHourly}/hr safe</span>
-        </div>
-        ` : `
-        <div style="font-size:10px;color:#888;background:#1a1a2e;padding:4px 8px;border-radius:4px;margin-bottom:8px;text-align:center;">
-          New account — building activity profile
-        </div>
-        `}
+  <!-- Mode tabs -->
+  <div style="display:flex;gap:3px;margin-bottom:8px;background:#1a1a2e;border-radius:6px;padding:2px;">
+    <button id="itk-mode-u" style="flex:1;padding:5px 8px;border:none;border-radius:5px;font-weight:600;font-size:11px;cursor:pointer;background:#ff0050;color:#fff;">Unfollow</button>
+    <button id="itk-mode-l" style="flex:1;padding:5px 8px;border:none;border-radius:5px;font-weight:600;font-size:11px;cursor:pointer;background:transparent;color:#888;">Like</button>
+  </div>
 
-        <div id="itk-status" style="font-size:12px;padding:6px 10px;background:#1a1a2e;border-radius:6px;margin-bottom:8px;text-align:center;border:1px solid transparent;transition:all 0.2s;">
-          Press <kbd style="background:#333;padding:1px 5px;border-radius:3px;border:1px solid #555;font-size:11px;">Enter</kbd> to start
-        </div>
+  <!-- Status -->
+  <div id="itk-status" style="font-size:11px;padding:5px 8px;background:#1a1a2e;border-radius:5px;margin-bottom:7px;text-align:center;border:1px solid transparent;">
+    Press <kbd style="background:#333;padding:1px 5px;border-radius:3px;border:1px solid #555;font-size:10px;">Enter</kbd> to start
+  </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;">
-          <div style="background:#1a1a2e;border-radius:6px;padding:6px 8px;">
-            <div style="font-size:10px;opacity:0.5;">Count</div>
-            <div style="font-weight:700;font-size:16px;" id="itk-count">${mode === 'unfollow' ? state.unfollowed : state.liked}</div>
-          </div>
-          <div style="background:#1a1a2e;border-radius:6px;padding:6px 8px;">
-            <div style="font-size:10px;opacity:0.5;">Progress</div>
-            <div style="font-weight:600;font-size:13px;" id="itk-progress">${mode === 'unfollow' ? state.unfollowed : state.liked} / ${mode === 'unfollow' ? config.unfollow.maxUnfollows : config.like.maxLikes}</div>
-          </div>
-          <div style="background:#1a1a2e;border-radius:6px;padding:6px 8px;">
-            <div style="font-size:10px;opacity:0.5;">Hourly</div>
-            <div style="font-weight:600;font-size:13px;" id="itk-hourly">${state.hourlyCount} / ${mode === 'unfollow' ? config.unfollow.hourlyLimit : safe.hourlyCap}</div>
-          </div>
-          <div style="background:#1a1a2e;border-radius:6px;padding:6px 8px;display:${mode === 'like' ? 'block' : 'none'};">
-            <div style="font-size:10px;opacity:0.5;">Comments/Post</div>
-            <div style="font-weight:600;font-size:13px;" id="itk-perpost">${avgComments}</div>
-          </div>
-        </div>
+  <!-- Stats grid -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px;">
+    <div style="background:#1a1a2e;border-radius:5px;padding:5px 7px;">
+      <div style="font-size:9px;opacity:0.45;">Count</div>
+      <div style="font-weight:700;font-size:15px;" id="itk-count">${mode === 'unfollow' ? st.unfollowed : st.liked}</div>
+    </div>
+    <div style="background:#1a1a2e;border-radius:5px;padding:5px 7px;">
+      <div style="font-size:9px;opacity:0.45;">Progress</div>
+      <div style="font-weight:600;font-size:12px;" id="itk-progress">${mode === 'unfollow' ? st.unfollowed : st.liked} / ${mode === 'unfollow' ? cfg.unfollow.maxUnfollows : cfg.like.maxLikes}</div>
+    </div>
+    <div style="background:#1a1a2e;border-radius:5px;padding:5px 7px;">
+      <div style="font-size:9px;opacity:0.45;">Hourly</div>
+      <div style="font-weight:600;font-size:12px;" id="itk-hourly">${st.hourlyCount} / ${mode === 'unfollow' ? cfg.unfollow.hourlyLimit : safe.hourly}</div>
+    </div>
+    <div style="background:#1a1a2e;border-radius:5px;padding:5px 7px;display:${mode === 'like' ? 'block' : 'none'};" id="itk-perpost-box">
+      <div style="font-size:9px;opacity:0.45;">Comments/Post</div>
+      <div style="font-weight:600;font-size:12px;" id="itk-perpost">${avg}</div>
+    </div>
+  </div>
 
-        <div style="width:100%;height:4px;background:#1a1a2e;border-radius:2px;margin:10px 0;overflow:hidden;">
-          <div id="itk-bar" style="height:100%;background:linear-gradient(90deg,#ff0050,#ff6b9d);border-radius:2px;transition:width 0.3s;width:${((mode === 'unfollow' ? state.unfollowed : state.liked) / (mode === 'unfollow' ? config.unfollow.maxUnfollows : config.like.maxLikes)) * 100}%;"></div>
-        </div>
+  <!-- Bar -->
+  <div id="itk-bar-wrap" style="width:100%;height:3px;background:#1a1a2e;border-radius:2px;margin:7px 0;overflow:hidden;">
+    <div id="itk-bar" style="height:100%;background:linear-gradient(90deg,#ff0050,#ff6b9d);border-radius:2px;width:${((mode === 'unfollow' ? st.unfollowed : st.liked) / Math.max(1, mode === 'unfollow' ? cfg.unfollow.maxUnfollows : cfg.like.maxLikes)) * 100}%;"></div>
+  </div>
 
-        <div id="itk-engaged-row" style="display:${mode === 'like' ? 'flex' : 'none'};justify-content:space-between;font-size:11px;opacity:0.6;margin-bottom:8px;">
-          <span>Posts: <span id="itk-engaged">${state.postsEngaged}</span></span>
-          <span>Comments: ${state.commentsLiked}</span>
-        </div>
+  <!-- Like-only row -->
+  <div id="itk-engaged-row" style="display:${mode === 'like' ? 'flex' : 'none'};justify-content:space-between;font-size:10px;opacity:0.55;margin-bottom:6px;">
+    <span>Posts: <span id="itk-engaged">${st.postsEngaged}</span></span>
+    <span>Comments: ${st.commentsLiked}</span>
+  </div>
 
-        <div id="itk-log" style="font-size:11px;padding:6px 8px;border-radius:4px;background:#1a1a2e;min-height:18px;word-break:break-word;color:#aaa;line-height:1.4;">
-          Ready
-        </div>
+  <!-- Log -->
+  <div id="itk-log" style="font-size:10px;padding:5px 7px;border-radius:4px;background:#1a1a2e;min-height:16px;word-break:break-word;color:#999;line-height:1.3;">
+    Ready · ${personality}
+  </div>
 
-        <div style="font-size:10px;opacity:0.4;margin-top:6px;text-align:center;">
-          ${mode === 'unfollow' ? 'Following list → Enter' : '#hashtag or feed → Enter'}
-        </div>
-
-        <details style="margin-top:8px;">
-          <summary style="cursor:pointer;font-size:11px;opacity:0.5;padding:4px 0;">⚙️ Settings</summary>
-          <div id="itk-settings-unfollow" style="margin-top:6px;">
-            <div style="font-size:10px;font-weight:600;color:#ff6b9d;margin-bottom:4px;">Unfollow</div>
-            <input type="number" id="itk-cfg-max" value="${config.unfollow.maxUnfollows}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
-            <input type="number" id="itk-cfg-hourly" value="${config.unfollow.hourlyLimit}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
-          </div>
-          <div id="itk-settings-like" style="margin-top:6px;display:none;">
-            <div style="font-size:10px;font-weight:600;color:#ff6b9d;margin-bottom:4px;">Like</div>
-            <input type="number" id="itk-cfg-like-max" value="${config.like.maxLikes}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
-            <input type="number" id="itk-cfg-like-comments" value="${config.like.maxCommentsPerPost}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
-          </div>
-          <div style="font-size:9px;opacity:0.3;margin-top:6px;text-align:center;">
-            Learning: ${limits.blockHistory.length} blocks | ${limits.totalSessions} sessions
-          </div>
-        </details>
-      </div>
-    `;
+  <!-- Settings (collapsible) -->
+  <details style="margin-top:6px;">
+    <summary style="cursor:pointer;font-size:10px;opacity:0.4;padding:2px 0;">⚙️</summary>
+    <div id="itk-s-u" style="margin-top:4px;">
+      <div style="font-size:9px;font-weight:600;color:#ff6b9d;margin-bottom:3px;">Unfollow</div>
+      <input type="number" id="itk-cfg-max" value="${cfg.unfollow.maxUnfollows}" style="width:100%;padding:2px 5px;border:1px solid rgba(255,255,255,0.06);border-radius:3px;background:#1a1a2e;color:#ddd;font-size:10px;margin:1px 0;">
+      <input type="number" id="itk-cfg-hourly" value="${cfg.unfollow.hourlyLimit}" style="width:100%;padding:2px 5px;border:1px solid rgba(255,255,255,0.06);border-radius:3px;background:#1a1a2e;color:#ddd;font-size:10px;margin:1px 0;">
+    </div>
+    <div id="itk-s-l" style="margin-top:4px;display:none;">
+      <div style="font-size:9px;font-weight:600;color:#ff6b9d;margin-bottom:3px;">Like</div>
+      <input type="number" id="itk-cfg-like-max" value="${cfg.like.maxLikes}" style="width:100%;padding:2px 5px;border:1px solid rgba(255,255,255,0.06);border-radius:3px;background:#1a1a2e;color:#ddd;font-size:10px;margin:1px 0;">
+      <input type="number" id="itk-cfg-like-comments" value="${cfg.like.maxCommentsPerPost}" style="width:100%;padding:2px 5px;border:1px solid rgba(255,255,255,0.06);border-radius:3px;background:#1a1a2e;color:#ddd;font-size:10px;margin:1px 0;">
+    </div>
+    <div style="font-size:8px;opacity:0.25;margin-top:4px;text-align:center;">
+      ${profile.blocks} blocks · ${profile.sessions} sessions · fingerprint: ${(FP % 10000).toString(16)}
+    </div>
+  </details>
+</div>`;
 
     document.body.appendChild(panel);
 
-    // Draggable
-    const dragHandle = panel.querySelector('#itk-drag');
-    let isDragging = false, ox, oy;
-    const p = panel.firstElementChild;
-    dragHandle.addEventListener('mousedown', (e) => {
-      isDragging = true;
-      ox = e.clientX - p.getBoundingClientRect().left;
-      oy = e.clientY - p.getBoundingClientRect().top;
+    // ---------- Draggable ----------
+    const drag = panel.querySelector('#itk-drag');
+    const wrapper = panel.firstElementChild;
+    let dragging = false, ox, oy;
+    drag.addEventListener('mousedown', e => {
+      dragging = true;
+      ox = e.clientX - wrapper.getBoundingClientRect().left;
+      oy = e.clientY - wrapper.getBoundingClientRect().top;
     });
-    document.addEventListener('mousemove', (e) => {
-      if (!isDragging) return;
-      p.style.left = (e.clientX - ox) + 'px';
-      p.style.top = (e.clientY - oy) + 'px';
-      p.style.right = 'auto';
+    document.addEventListener('mousemove', e => {
+      if (!dragging) return;
+      const x = clamp(e.clientX - ox, 0, window.innerWidth - 350);
+      const y = clamp(e.clientY - oy, 0, window.innerHeight - 400);
+      wrapper.style.left = x + 'px';
+      wrapper.style.top = y + 'px';
+      wrapper.style.position = 'fixed';
     });
-    document.addEventListener('mouseup', () => { isDragging = false; });
+    document.addEventListener('mouseup', () => { dragging = false; });
 
-    // Tab switching
-    const unfollowTab = panel.querySelector('#itk-mode-unfollow');
-    const likeTab = panel.querySelector('#itk-mode-like');
-    const settingsUnfollow = panel.querySelector('#itk-settings-unfollow');
-    const settingsLike = panel.querySelector('#itk-settings-like');
-    const engagedRow = panel.querySelector('#itk-engaged-row');
+    // ---------- Mode Tabs ----------
+    const uTab = panel.querySelector('#itk-mode-u');
+    const lTab = panel.querySelector('#itk-mode-l');
+    const sU   = panel.querySelector('#itk-s-u');
+    const sL   = panel.querySelector('#itk-s-l');
+    const eRow = panel.querySelector('#itk-engaged-row');
+    const ppBox = panel.querySelector('#itk-perpost-box');
 
-    function switchMode(newMode) {
+    function switchMode(m) {
       if (running) return;
-      mode = newMode;
-
-      unfollowTab.style.background = newMode === 'unfollow' ? '#ff0050' : 'transparent';
-      unfollowTab.style.color = newMode === 'unfollow' ? 'white' : '#888';
-      likeTab.style.background = newMode === 'like' ? '#ff0050' : 'transparent';
-      likeTab.style.color = newMode === 'like' ? 'white' : '#888';
-
-      settingsUnfollow.style.display = newMode === 'unfollow' ? 'block' : 'none';
-      settingsLike.style.display = newMode === 'like' ? 'block' : 'none';
-
-      if (engagedRow) engagedRow.style.display = newMode === 'like' ? 'flex' : 'none';
-
+      mode = m;
+      uTab.style.background = m === 'unfollow' ? '#ff0050' : 'transparent';
+      uTab.style.color     = m === 'unfollow' ? '#fff' : '#888';
+      lTab.style.background = m === 'like' ? '#ff0050' : 'transparent';
+      lTab.style.color     = m === 'like' ? '#fff' : '#888';
+      sU.style.display     = m === 'unfollow' ? 'block' : 'none';
+      sL.style.display     = m === 'like' ? 'block' : 'none';
+      if (eRow) eRow.style.display = m === 'like' ? 'flex' : 'none';
+      if (ppBox) ppBox.style.display = m === 'like' ? 'block' : 'none';
       updateUI();
     }
 
-    unfollowTab.addEventListener('click', () => switchMode('unfollow'));
-    likeTab.addEventListener('click', () => switchMode('like'));
+    uTab.addEventListener('click', () => switchMode('unfollow'));
+    lTab.addEventListener('click', () => switchMode('like'));
   }
 
-  // ======================== ENTER KEY ========================
+  // ========================================================================
+  //  ENTER KEY HANDLER
+  // ========================================================================
 
-  document.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter' && !e.repeat) {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      e.preventDefault();
+  document.addEventListener('keydown', async e => {
+    if (e.key !== 'Enter' || e.repeat) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    e.preventDefault();
 
-      if (running) {
-        stopped = true;
-        running = false;
-        const logArea = document.getElementById('itk-log');
-        const statusEl = document.getElementById('itk-status');
-        const count = mode === 'unfollow' ? state.unfollowed : state.liked;
-        const action = mode === 'unfollow' ? 'unfollowed' : 'liked';
-        if (logArea) logArea.textContent = `■ Stopped (${count} ${action})`;
-        if (statusEl) { statusEl.textContent = `■ Stopped`; statusEl.style.background = ''; }
-        log('Stopped by user');
-        return;
-      }
-
-      // Read config
-      if (mode === 'unfollow') {
-        const maxEl = document.getElementById('itk-cfg-max');
-        const hourlyEl = document.getElementById('itk-cfg-hourly');
-        if (maxEl) config.unfollow.maxUnfollows = parseInt(maxEl.value) || DEFAULTS.unfollow.maxUnfollows;
-        if (hourlyEl) config.unfollow.hourlyLimit = parseInt(hourlyEl.value) || DEFAULTS.unfollow.hourlyLimit;
-      } else {
-        const maxEl = document.getElementById('itk-cfg-like-max');
-        const commentsEl = document.getElementById('itk-cfg-like-comments');
-        if (maxEl) config.like.maxLikes = parseInt(maxEl.value) || DEFAULTS.like.maxLikes;
-        if (commentsEl) config.like.maxCommentsPerPost = parseInt(commentsEl.value) || DEFAULTS.like.maxCommentsPerPost;
-      }
-
-      stopped = false;
-      running = true;
-      state.emptyRounds = 0;
-      state.consecutiveErrors = 0;
-
-      const logArea = document.getElementById('itk-log');
-      const statusEl = document.getElementById('itk-status');
-      if (logArea) logArea.textContent = `▶ ${mode}...`;
-      if (statusEl) {
-        statusEl.textContent = `▶ Running`;
-        statusEl.style.background = '';
-        statusEl.style.border = '';
-      }
-      log(`Engine started in ${mode} mode`);
-
-      await instatakkerEngine();
+    if (running) {
+      stopped = true;
       running = false;
+      const c = mode === 'unfollow' ? st.unfollowed : st.liked;
+      const a = mode === 'unfollow' ? 'unfollowed' : 'liked';
+      const logEl = document.getElementById('itk-log');
+      const stEl  = document.getElementById('itk-status');
+      if (logEl) logEl.textContent = `■ Stopped (${c} ${a})`;
+      if (stEl) { stEl.textContent = `■ Stopped`; stEl.style.background = ''; }
+      log('Stopped by user');
+      return;
     }
+
+    // Read settings
+    if (mode === 'unfollow') {
+      const m = document.getElementById('itk-cfg-max');
+      const h = document.getElementById('itk-cfg-hourly');
+      if (m) cfg.unfollow.maxUnfollows = parseInt(m.value) || DEFAULTS.unfollow.maxUnfollows;
+      if (h) cfg.unfollow.hourlyLimit  = parseInt(h.value) || DEFAULTS.unfollow.hourlyLimit;
+    } else {
+      const m = document.getElementById('itk-cfg-like-max');
+      const c = document.getElementById('itk-cfg-like-comments');
+      if (m) cfg.like.maxLikes = parseInt(m.value) || DEFAULTS.like.maxLikes;
+      if (c) cfg.like.maxCommentsPerPost = parseInt(c.value) || DEFAULTS.like.maxCommentsPerPost;
+    }
+
+    stopped = false;
+    running = true;
+    st.emptyRounds = 0;
+    st.consecutiveErrors = 0;
+
+    const logEl = document.getElementById('itk-log');
+    const stEl  = document.getElementById('itk-status');
+    if (logEl) logEl.textContent = `▶ ${mode}...`;
+    if (stEl) {
+      stEl.textContent = `▶ Running`;
+      stEl.style.background = 'rgba(255,0,80,0.08)';
+      stEl.style.border = '1px solid rgba(255,0,80,0.25)';
+    }
+    log(`Engine starting — ${mode} mode (session ${profile.sessions})`);
+
+    await engine();
+    running = false;
   });
 
-  // ======================== INIT ========================
+  // ========================================================================
+  //  INIT
+  // ========================================================================
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', createPanel);
@@ -917,5 +1072,8 @@
     createPanel();
   }
 
-  console.log(`%c⏹ Instatakker v${VERSION} — press Enter`, 'color: #ff0050; font-size: 14px; font-weight: bold;');
+  console.log(`%c⏹ Instatakker v${VERSION} — press Enter to start`,
+    'color:#ff0050;font-size:14px;font-weight:bold;');
+  console.log(`%c  Session fingerprint: ${FP} | ${profile.sessions} sessions`,
+    'color:#888;font-size:11px;');
 })();
