@@ -12,7 +12,7 @@
 (function() {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.1';
 
   // ======================== CONFIG ========================
 
@@ -442,8 +442,9 @@
 
   async function instatakkerEngine() {
     state.startTime = state.startTime || Date.now();
-    const logArea = document.getElementById('itk-log');
-    const statusEl = document.getElementById('itk-status');
+    const logArea = log-content
+    const statusEl = status
+
     const safeLimits = getSafeLimits();
 
     // Show learned limits at start
@@ -684,10 +685,10 @@
   // ======================== UI ========================
 
   function updateUI() {
-    const countEl = document.getElementById('itk-count');
-    const progressEl = document.getElementById('itk-progress');
+    const countEl = stat-count;
+    const progressEl = stat-progress;
     const barEl = document.getElementById('itk-bar');
-    const hourlyEl = document.getElementById('itk-hourly');
+    const hourlyEl = stat-hourly;
     const perPostEl = document.getElementById('itk-perpost');
     const engagedEl = document.getElementById('itk-engaged');
 
@@ -855,67 +856,36 @@
     unfollowTab.addEventListener('click', () => switchMode('unfollow'));
     likeTab.addEventListener('click', () => switchMode('like'));
   }
+// ======================== APP CONTROL API ========================
 
-  // ======================== ENTER KEY ========================
+window.Instatakker = {
+  start: async function(selectedMode = 'unfollow') {
+    if (running) return;
 
-  document.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter' && !e.repeat) {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      e.preventDefault();
+    mode = selectedMode;
+    stopped = false;
+    running = true;
+    state.emptyRounds = 0;
+    state.consecutiveErrors = 0;
 
-      if (running) {
-        stopped = true;
-        running = false;
-        const logArea = document.getElementById('itk-log');
-        const statusEl = document.getElementById('itk-status');
-        const count = mode === 'unfollow' ? state.unfollowed : state.liked;
-        const action = mode === 'unfollow' ? 'unfollowed' : 'liked';
-        if (logArea) logArea.textContent = `■ Stopped (${count} ${action})`;
-        if (statusEl) { statusEl.textContent = `■ Stopped`; statusEl.style.background = ''; }
-        log('Stopped by user');
-        return;
-      }
+    log(`Engine started in ${mode} mode`);
 
-      // Read config
-      if (mode === 'unfollow') {
-        const maxEl = document.getElementById('itk-cfg-max');
-        const hourlyEl = document.getElementById('itk-cfg-hourly');
-        if (maxEl) config.unfollow.maxUnfollows = parseInt(maxEl.value) || DEFAULTS.unfollow.maxUnfollows;
-        if (hourlyEl) config.unfollow.hourlyLimit = parseInt(hourlyEl.value) || DEFAULTS.unfollow.hourlyLimit;
-      } else {
-        const maxEl = document.getElementById('itk-cfg-like-max');
-        const commentsEl = document.getElementById('itk-cfg-like-comments');
-        if (maxEl) config.like.maxLikes = parseInt(maxEl.value) || DEFAULTS.like.maxLikes;
-        if (commentsEl) config.like.maxCommentsPerPost = parseInt(commentsEl.value) || DEFAULTS.like.maxCommentsPerPost;
-      }
+    await instatakkerEngine();
 
-      stopped = false;
-      running = true;
-      state.emptyRounds = 0;
-      state.consecutiveErrors = 0;
+    running = false;
+  },
 
-      const logArea = document.getElementById('itk-log');
-      const statusEl = document.getElementById('itk-status');
-      if (logArea) logArea.textContent = `▶ ${mode}...`;
-      if (statusEl) {
-        statusEl.textContent = `▶ Running`;
-        statusEl.style.background = '';
-        statusEl.style.border = '';
-      }
-      log(`Engine started in ${mode} mode`);
-
-      await instatakkerEngine();
-      running = false;
-    }
-  });
-
-  // ======================== INIT ========================
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', createPanel);
-  } else {
-    createPanel();
+  stop: function() {
+    stopped = true;
+    running = false;
+    log('Stopped by app');
   }
+};
+// ======================== INIT ========================
 
-  console.log(`%c⏹ Instatakker v${VERSION} — press Enter`, 'color: #ff0050; font-size: 14px; font-weight: bold;');
+console.log(
+  `%c⏹ Instatakker v${VERSION} loaded`,
+  'color: #ff0050; font-size: 14px; font-weight: bold;'
+);
+
 })();
