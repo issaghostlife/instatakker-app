@@ -1053,4 +1053,30 @@
   );
   console.log(`%c${mode === 'like' ? 'Like' : 'Unfollow'} mode | Press Enter to start`, 'color: #888; font-size: 12px;');
 
+
+// ======================== APP CONTROL API ========================
+
+window.Instatakker = {
+  start: async function(selectedMode = "unfollow") {
+    if (running) return;
+
+    mode = selectedMode;
+    stopped = false;
+    running = true;
+    state.emptyRounds = 0;
+    state.consecutiveErrors = 0;
+
+    log(`Engine started in ${mode} mode`);
+
+    await instatakkerEngine();
+
+    running = false;
+  },
+
+  stop: function() {
+    stopped = true;
+    running = false;
+    log("Stopped by app");
+  }
+};
 })();

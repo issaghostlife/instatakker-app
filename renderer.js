@@ -8,7 +8,7 @@ let running = false;
 let scriptInjected = false;
 
 const APP_VERSION = "1.0.1";
-const NEWS_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/news.json";
+
 
 const $ = (id) => document.getElementById(id);
 
@@ -202,48 +202,30 @@ async function loadNews() {
   if (!versionEl || !titleEl || !listEl) return;
 
   try {
-    const res = await fetch(`${NEWS_URL}?t=${Date.now()}`, {
-      cache: "no-store"
-    });
+    const result = await window.instatakkerAPI.getNews();
+    const news = result.data;
 
-    if (!res.ok) throw new Error(`News failed: ${res.status}`);
-
-    const news = await res.json();
-
-    versionEl.textContent = news.version ? `v${news.version}` : `v${APP_VERSION}`;
+    versionEl.textContent = news.version ? `v${news.version}` : "v1.0.1";
     titleEl.textContent = news.title || "Latest Instatakker Updates";
 
     listEl.innerHTML = "";
 
     const items = Array.isArray(news.items) ? news.items : [];
 
-    if (!items.length) {
+    items.forEach((item) => {
       const li = document.createElement("li");
-      li.textContent = "No new updates right now.";
+      li.textContent = item;
       listEl.appendChild(li);
-    } else {
-      items.slice(0, 5).forEach((item) => {
-        const li = document.createElement("li");
-        li.textContent = item;
-        listEl.appendChild(li);
-      });
-    }
+    });
 
     if (noticeEl) {
       noticeEl.textContent =
         news.notice || "Copyright © 2026 Instatakker. All rights reserved.";
     }
   } catch (err) {
-    if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
-    if (titleEl) titleEl.textContent = "News unavailable";
-    if (listEl) {
-      listEl.innerHTML = "";
-      const li = document.createElement("li");
-      li.textContent = "Could not load live news. Check your connection or GitHub URL.";
-      listEl.appendChild(li);
-    }
-
-    console.warn(err);
+    versionEl.textContent = "v1.0.1";
+    titleEl.textContent = "News unavailable";
+    listEl.innerHTML = "<li>Could not load live news.</li>";
   }
 }
 
