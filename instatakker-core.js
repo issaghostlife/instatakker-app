@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instatakker
 // @namespace    http://instatakker.io
-// @version      1.0.1
+// @version      2.0.0
 // @description  Instagram automation — unfollow + like everything (posts + comments) like a human
 // @author       Instatakker
 // @match        https://www.instagram.com/*
@@ -12,7 +12,7 @@
 (function() {
   'use strict';
 
-  const VERSION = '1.0.1';
+  const VERSION = '2.0.0';
 
   // ======================== CONFIG ========================
 
@@ -58,14 +58,11 @@
     consecutiveErrors: 0,
   };
 
-  // ======================== 🆕 POST ITERATOR ========================
-  // Tracks which post we're on so we go sequentially, not randomly
+  // ======================== POST ITERATOR ========================
+  // Tracks which post we're on — sequential, top-to-bottom
   let postIterator = {
     index: 0,
-    lastPostKey: null,
     seenKeys: new Set(),
-    scrollAttempts: 0,
-    maxScrollAttempts: 5,
   };
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -229,28 +226,21 @@
     return false;
   }
 
-  // ======================== 🆕 GET ALL POST LINKS IN ORDER ========================
+  // ======================== GET ALL VISIBLE POST LINKS (SEQUENTIAL) ========================
 
-  /**
-   * Get all post links on the page, sorted top-to-bottom, deduplicated.
-   * Returns array of { element, href, rect }
-   */
   function getAllPostLinks() {
-    // Get all links to posts
+    // Get all links to posts on the page (not in dialogs)
     const allLinks = [...document.querySelectorAll('a[href*="/p/"]')]
-      .filter(a => a.offsetParent !== null) // visible only
+      .filter(a => {
+        // Must be visible and not inside a dialog
+        if (a.closest('div[role="dialog"]')) return false;
+        try { return a.offsetParent !== null; } catch(e) { return false; }
+      })
       .map(a => ({
         element: a,
         href: a.getAttribute('href'),
         rect: a.getBoundingClientRect(),
-        article: a.closest('article'),
-      }))
-      .filter(item => {
-        // Must be in an article and not be in a dialog
-        if (!item.article) return false;
-        if (item.element.closest('div[role="dialog"]')) return false;
-        return true;
-      });
+      }));
 
     // Deduplicate by href
     const seen = new Set();
@@ -261,113 +251,69 @@
       unique.push(item);
     }
 
-    // Sort top-to-bottom
+    // Sort top-to-bottom on the page
     unique.sort((a, b) => a.rect.top - b.rect.top);
 
     return unique;
   }
 
-  /**
-   * 🆕 Get the next unprocessed post link.
-   * Uses postIterator.index to track sequential position.
-   * Resets index if new posts loaded via scroll.
-   */
-  function getNextPostLink(logArea) {
+  function getNextUnprocessedPost() {
     const posts = getAllPostLinks();
-    if (posts.length === 0) return null;
-
-    // If our index is out of bounds, reset
-    if (postIterator.index >= posts.length) {
-      postIterator.index = 0;
-    }
-
-    // Find the next post we haven't seen yet
+    // Walk through sequentially from current index
     for (let i = postIterator.index; i < posts.length; i++) {
-      const post = posts[i];
-      if (!postIterator.seenKeys.has(post.href)) {
+      if (!postIterator.seenKeys.has(posts[i].href)) {
         postIterator.index = i;
-        return post;
+        return posts[i];
       }
     }
-
-    // All remaining posts seen — scroll for more
     return null;
   }
 
-  /**
-   * 🆕 Mark a post as processed so we skip it next time.
-   */
   function markPostProcessed(href) {
     postIterator.seenKeys.add(href);
     postIterator.index++;
-    postIterator.scrollAttempts = 0;
   }
 
-  /**
-   * 🆕 Open the next post and wait for the dialog to appear.
-   */
   async function openNextPost(logArea) {
-    // Reset iterator on fresh starts
-    if (state.postsEngaged === 0 && postIterator.index === 0 && postIterator.seenKeys.size === 0) {
-      // Fresh start, clear seen keys except maybe track last
-    }
-
-    let post = getNextPostLink(logArea);
-
-    // If no more posts, scroll to load more
+    const post = getNextUnprocessedPost();
     if (!post) {
-      if (postIterator.scrollAttempts >= postIterator.maxScrollAttempts) {
-        if (logArea) logArea.textContent = '⚠️ No more posts after scrolling.';
-        return false;
-      }
-
-      if (logArea) logArea.textContent = `📜 Scrolling for more posts...`;
-      await humanScroll(1500);
-      await sleep(randDelay(2000, 4000));
-      postIterator.scrollAttempts++;
-
-      // Retry
-      post = getNextPostLink(logArea);
-      if (!post) {
-        if (logArea) logArea.textContent = '⚠️ No more posts found.';
-        return false;
-      }
+      if (logArea) logArea.textContent = '✅ All visible posts processed.';
+      return null;
     }
 
-    // Click the post
-    log(`Opening post: ${post.href} (#${postIterator.index + 1})`);
+    log(`Opening post: ${post.href} (#${postIterator.index})`);
     if (logArea) {
       logArea.textContent = `📱 Opening post #${state.postsEngaged + 1}...`;
     }
 
-    // Scroll it into view first
+    // Scroll into view first so it's clickable
     try {
       post.element.scrollIntoView({ block: 'center' });
       await sleep(randDelay(500, 1000));
     } catch(e) {}
 
-    // Click to open dialog
+    // Click the post link
     post.element.click();
     await sleep(randDelay(2000, 3500));
 
     // Wait for dialog to appear
-    for (let i = 0; i < 25; i++) {
-      if (stopped || !running) return false;
+    for (let i = 0; i < 30; i++) {
+      if (stopped || !running) return null;
       if (document.querySelector('div[role="dialog"] article')) {
         markPostProcessed(post.href);
-        log(`Post dialog opened for ${post.href}`);
+        log(`✅ Dialog opened for ${post.href}`);
         return true;
       }
       await sleep(400);
     }
 
-    // Sometimes clicking the <a> doesn't work — try clicking parent div
-    const parentDiv = post.element.closest('div[class*="html-div"]');
+    // Fallback: try clicking parent
+    const parentDiv = post.element.closest('div[class*="html-div"], div[class*="x1iyjqo2"]');
     if (parentDiv && parentDiv !== post.element) {
       parentDiv.click();
       await sleep(2000);
       for (let i = 0; i < 20; i++) {
-        if (stopped || !running) return false;
+        if (stopped || !running) return null;
         if (document.querySelector('div[role="dialog"] article')) {
           markPostProcessed(post.href);
           return true;
@@ -376,8 +322,8 @@
       }
     }
 
-    // If still no dialog, skip this post
-    log(`Failed to open dialog for ${post.href} — skipping`);
+    // Skipping this post — dialog never opened
+    log(`⚠️ Could not open dialog for ${post.href} — skipping`);
     markPostProcessed(post.href);
     return false;
   }
@@ -448,6 +394,7 @@
   function clickLoadMoreComments() {
     const dialog = document.querySelector('div[role="dialog"]');
 
+    // Load more comments button
     if (dialog) {
       const loadMoreBtn = [...dialog.querySelectorAll('button')].find(b =>
         b.textContent.trim().toLowerCase().includes('load more comments') ||
@@ -460,6 +407,7 @@
       }
     }
 
+    // SVG-based load more
     const loadMoreSvg = document.querySelector('svg[aria-label="Load more comments"]');
     if (loadMoreSvg) {
       const clickable = loadMoreSvg.closest('button') ||
@@ -573,6 +521,7 @@
       }
     }
 
+    // Escape key fallback
     document.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Escape',
       keyCode: 27,
@@ -582,6 +531,7 @@
     }));
     await sleep(500);
 
+    // Global close button
     const globalClose = document.querySelector('svg[aria-label="Close"]')?.closest('button');
     if (globalClose) {
       globalClose.click();
@@ -596,7 +546,7 @@
     return !document.querySelector('div[role="dialog"] article');
   }
 
-  // ======================== LIKE ALL COMMENTS ========================
+  // ======================== LIKE ALL COMMENTS (scroll comments for more) ========================
 
   async function likeAllComments(logArea, statusEl) {
     let commentsLiked = 0;
@@ -628,6 +578,7 @@
         break;
       }
 
+      // Click "Load more comments" button
       const loadClicked = clickLoadMoreComments();
       if (loadClicked) {
         await sleep(randDelay(2000, 3500));
@@ -635,9 +586,11 @@
         if (logArea) logArea.textContent = `📄 Loaded more comments (${commentsLiked} liked)`;
       }
 
+      // Scroll within the comment section to trigger lazy loading
       scrollCommentSection();
       await sleep(randDelay(1000, 2000));
 
+      // Find unliked comments
       const unlikedSvgs = getUnlikedCommentButtons();
 
       if (unlikedSvgs.length > 0) {
@@ -710,7 +663,7 @@
     return commentsLiked;
   }
 
-  // ======================== 🆕 MAIN ENGINE — AUTO NEXT POST ========================
+  // ======================== MAIN ENGINE ========================
 
   async function instatakkerEngine() {
     state.startTime = state.startTime || Date.now();
@@ -720,10 +673,9 @@
     const logArea = document.getElementById('itk-log');
     const statusEl = document.getElementById('itk-status');
 
-    // 🆕 Reset post iterator on fresh start
+    // Reset post iterator on each engine start
     postIterator.index = 0;
     postIterator.seenKeys = new Set();
-    postIterator.scrollAttempts = 0;
 
     if (limits.blockHistory.length >= 2) {
       if (logArea) {
@@ -761,10 +713,7 @@
 
         state.hourlyCount = 0;
         state.hourlyReset = Date.now();
-
-        if (statusEl) {
-          statusEl.style.background = '';
-        }
+        if (statusEl) statusEl.style.background = '';
         continue;
       }
 
@@ -843,7 +792,7 @@
         await sleep(config.unfollow.scrollWait);
 
       } else {
-        // ===================== 🆕 LIKE MODE — AUTO NEXT POST =====================
+        // ===================== LIKE MODE — AUTO NEXT POST =====================
 
         const safe = getSafeLimits();
         if (state.hourlyCount >= safe.hourlyCap * 0.9) {
@@ -853,11 +802,20 @@
           }
         }
 
-        // 🆕 Open the next post in sequence (NOT random)
+        // --- Open the next unprocessed post (sequential, no page scrolling) ---
         const opened = await openNextPost(logArea);
+        if (opened === null) {
+          // No more unprocessed posts — we're done
+          if (logArea) {
+            const count = state.liked;
+            logArea.textContent = `✅ Done — liked ${count} posts, ${state.commentsLiked} comments across ${state.postsEngaged} posts`;
+          }
+          log('All visible posts processed. Stopping.');
+          break;
+        }
+
         if (!opened) {
-          if (logArea) logArea.textContent = '⚠️ No more posts found. Navigate to feed.';
-          await sleep(5000);
+          // Couldn't open dialog for this post but skipped it — continue to next
           continue;
         }
 
@@ -882,8 +840,8 @@
           if (logArea) logArea.textContent = `⚠️ Could not like post (${state.liked} total)`;
         }
 
-        // --- Step 2: Like COMMENTS ---
-        if (logArea) logArea.textContent = `💬 Liking comments...`;
+        // --- Step 2: Like all COMMENTS (scrolling within the comment section) ---
+        if (logArea) logArea.textContent = `💬 Liking comments on post #${state.postsEngaged}...`;
         const commentCount = await likeAllComments(logArea, statusEl);
 
         if (commentCount > 0) {
@@ -893,28 +851,28 @@
           if (logArea) logArea.textContent = `💬 No new comments to like`;
         }
 
-        // --- Step 3: Close post — then loop will open the NEXT one ---
+        // --- Step 3: Close the post — loop will open the next one ---
         if (!stopped && running) {
-          if (logArea) logArea.textContent = `➡️ Closing post...`;
+          if (logArea) logArea.textContent = `➡️ Closing post #${state.postsEngaged}...`;
           log('Closing post');
 
           await closePost();
           await sleep(randDelay(1500, 3000));
 
-          // Human scroll — move past the closed post
-          await humanScroll(400);
-          await sleep(randDelay(1500, 3000));
+          // Small nudge to reposition after dialog closes
+          await humanScroll(200);
+          await sleep(randDelay(1000, 2000));
 
-          // Update stats
+          // Update UI stats
           recordSafeOperation();
           const newsafe = getSafeLimits();
           const avgComments = state.postsEngaged > 0
             ? Math.round(state.commentsLiked / state.postsEngaged)
             : 0;
 
-          const remainingPosts = getAllPostLinks().length;
           if (logArea) {
-            logArea.textContent = `📊 ${state.liked} liked | ${state.hourlyCount}/${newsafe.hourlyCap}/hr | ~${avgComments}/post | ${remainingPosts} remaining`;
+            const remaining = getAllPostLinks().filter(p => !postIterator.seenKeys.has(p.href)).length;
+            logArea.textContent = `📊 ${state.liked} liked | ${state.hourlyCount}/${newsafe.hourlyCap}/hr | ~${avgComments}/post | ${remaining} remaining`;
           }
         }
       }
@@ -922,7 +880,7 @@
 
     running = false;
     if (logArea) {
-      if (!logArea.textContent.includes('Done') && !logArea.textContent.includes('No more')) {
+      if (!logArea.textContent.includes('Done') && !logArea.textContent.includes('processed')) {
         const count = mode === 'unfollow' ? state.unfollowed : state.liked;
         const action = mode === 'unfollow' ? 'unfollowed' : 'liked';
         logArea.textContent = `■ Stopped (${count} ${action}, ${state.commentsLiked} comments)`;
@@ -1149,16 +1107,14 @@
       e.preventDefault();
 
       if (!running) {
-        // Start
         stopped = false;
         running = true;
         state.emptyRounds = 0;
         state.consecutiveErrors = 0;
 
-        // 🆕 Reset post iterator
+        // Reset post iterator on each start
         postIterator.index = 0;
         postIterator.seenKeys = new Set();
-        postIterator.scrollAttempts = 0;
 
         sessionStorage.setItem('instatakker_state', JSON.stringify({
           liked: state.liked,
@@ -1179,7 +1135,6 @@
         await instatakkerEngine();
         running = false;
       } else {
-        // Stop
         stopped = true;
         running = false;
         log('Stopped by user');
@@ -1193,7 +1148,7 @@
     }
   });
 
-  // ======================== 🆕 INSTATAKKER API ========================
+  // ======================== INSTATAKKER API ========================
 
   window.Instatakker = {
     start: async function(selectedMode) {
@@ -1207,7 +1162,6 @@
 
       postIterator.index = 0;
       postIterator.seenKeys = new Set();
-      postIterator.scrollAttempts = 0;
 
       log(`API start in ${mode} mode`);
       await instatakkerEngine();
@@ -1231,7 +1185,7 @@
           blockCount: limits.blockHistory.length,
           totalSessions: limits.totalSessions,
         },
-        postIterator: { ...postIterator, seenKeys: postIterator.seenKeys.size },
+        postIterator: { index: postIterator.index, seenKeys: postIterator.seenKeys.size },
         version: VERSION,
       };
     },
