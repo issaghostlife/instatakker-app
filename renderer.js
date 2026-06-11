@@ -1,5 +1,14 @@
+/*
+ * Instatakker v1.0.1
+ * Copyright © 2026 Instatakker. All rights reserved.
+ */
+
 let currentMode = "unfollow";
 let running = false;
+let scriptInjected = false;
+
+const APP_VERSION = "1.0.1";
+const NEWS_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/news.json";
 
 const $ = (id) => document.getElementById(id);
 
@@ -14,7 +23,24 @@ function setStatus(msg) {
   if (el) el.textContent = msg;
 }
 
+function setRunningUI(isRunning) {
+  running = isRunning;
+
+  const startBtn = $("btn-start");
+
+  if (startBtn) {
+    startBtn.textContent = isRunning ? "Stop" : "Start";
+    startBtn.classList.toggle("btn-secondary", isRunning);
+    startBtn.classList.toggle("btn-primary", !isRunning);
+  }
+}
+
 function switchMode(mode) {
+  if (running) {
+    log("Stop first before switching mode.");
+    return;
+  }
+
   currentMode = mode;
 
   document.querySelectorAll(".mode-btn").forEach((btn) => {
@@ -35,6 +61,7 @@ function switchMode(mode) {
 }
 
 async function openInstagram() {
+  const app = $("app");
   const browserPanel = $("browser-panel");
   const browser = $("browser");
   const urlBar = $("url-bar");
@@ -46,6 +73,7 @@ async function openInstagram() {
 
   const url = await window.instatakkerAPI.loadInstagram();
 
+  if (app) app.classList.add("browser-open");
   if (browserPanel) browserPanel.style.display = "block";
   if (urlBar) urlBar.value = url;
 
@@ -55,18 +83,30 @@ async function openInstagram() {
   setStatus("Instagram loading...");
 }
 
-async function injectScript() {
+async function ensureInstagramOpen() {
   const browser = $("browser");
 
   if (!browser) {
     log("Missing browser webview.");
-    return;
+    return false;
   }
 
   if (!browser.src || browser.src === "about:blank") {
     await openInstagram();
-    log("Instagram opened. Login first, then click Start again.");
-    return;
+    log("Instagram opened. Login first, then click Start.");
+    return false;
+  }
+
+  return true;
+}
+
+async function injectCoreIfNeeded() {
+  const browser = $("browser");
+
+  if (!browser) return false;
+
+  if (scriptInjected) {
+    return true;
   }
 
   const script = await window.instatakkerAPI.getScript();
@@ -74,17 +114,136 @@ async function injectScript() {
   if (!script || !script.trim()) {
     log("Missing instatakker-core.js. Copy your userscript into the app folder.");
     alert("Missing instatakker-core.js");
-    return;
+    return false;
   }
 
   try {
     await browser.executeJavaScript(script);
-    running = true;
-    setStatus(`Running ${currentMode} mode`);
-    log(`Injected InstaTakker script. Press Enter inside Instagram or use the floating panel.`);
+    scriptInjected = true;
+    log("Instatakker core loaded.");
+    return true;
   } catch (err) {
     console.error(err);
     log("Script injection failed. Check DevTools.");
+    return false;
+  }
+}
+
+async function startAutomation() {
+  const browser = $("browser");
+
+  const instagramReady = await ensureInstagramOpen();
+  if (!instagramReady) return;
+
+  const injected = await injectCoreIfNeeded();
+  if (!injected) return;
+
+  try {
+    const result = await browser.executeJavaScript(`
+      (async () => {
+        if (!window.Instatakker || typeof window.Instatakker.start !== "function") {
+          return "MISSING_START_API";
+        }
+
+        window.Instatakker.start("${currentMode}");
+        return "STARTED";
+      })();
+    `);
+
+    if (result === "MISSING_START_API") {
+      log("Core needs update: window.Instatakker.start() is missing.");
+      alert("Your instatakker-core.js needs the new Start API.");
+      return;
+    }
+
+    setRunningUI(true);
+    setStatus(`Running ${currentMode} mode`);
+    log(`Started ${currentMode} mode from main app.`);
+  } catch (err) {
+    console.error(err);
+    log("Failed to start automation.");
+  }
+}
+
+async function stopAutomation() {
+  const browser = $("browser");
+
+  if (!browser) return;
+
+  try {
+    await browser.executeJavaScript(`
+      if (window.Instatakker && typeof window.Instatakker.stop === "function") {
+        window.Instatakker.stop();
+      }
+    `);
+  } catch (err) {
+    console.error(err);
+  }
+
+  setRunningUI(false);
+  setStatus("Stopped");
+  log("Stopped by main app.");
+}
+
+async function toggleAutomation() {
+  if (running) {
+    await stopAutomation();
+  } else {
+    await startAutomation();
+  }
+}
+
+async function loadNews() {
+  const versionEl = $("news-version");
+  const titleEl = $("news-title");
+  const listEl = $("news-list");
+  const noticeEl = $("news-notice");
+
+  if (!versionEl || !titleEl || !listEl) return;
+
+  try {
+    const res = await fetch(`${NEWS_URL}?t=${Date.now()}`, {
+      cache: "no-store"
+    });
+
+    if (!res.ok) throw new Error(`News failed: ${res.status}`);
+
+    const news = await res.json();
+
+    versionEl.textContent = news.version ? `v${news.version}` : `v${APP_VERSION}`;
+    titleEl.textContent = news.title || "Latest Instatakker Updates";
+
+    listEl.innerHTML = "";
+
+    const items = Array.isArray(news.items) ? news.items : [];
+
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.textContent = "No new updates right now.";
+      listEl.appendChild(li);
+    } else {
+      items.slice(0, 5).forEach((item) => {
+        const li = document.createElement("li");
+        li.textContent = item;
+        listEl.appendChild(li);
+      });
+    }
+
+    if (noticeEl) {
+      noticeEl.textContent =
+        news.notice || "Copyright © 2026 Instatakker. All rights reserved.";
+    }
+  } catch (err) {
+    if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
+    if (titleEl) titleEl.textContent = "News unavailable";
+    if (listEl) {
+      listEl.innerHTML = "";
+      const li = document.createElement("li");
+      li.textContent = "Could not load live news. Check your connection or GitHub URL.";
+      listEl.appendChild(li);
+    }
+
+    console.warn(err);
   }
 }
 
@@ -111,7 +270,7 @@ function wireButtons() {
   }
 
   if (startBtn) {
-    startBtn.addEventListener("click", injectScript);
+    startBtn.addEventListener("click", toggleAutomation);
   }
 
   document.querySelectorAll(".mode-btn").forEach((btn) => {
@@ -141,7 +300,11 @@ function wireButtons() {
 
   if (refreshBtn) {
     refreshBtn.addEventListener("click", () => {
-      if (browser) browser.reload();
+      if (browser) {
+        scriptInjected = false;
+        setRunningUI(false);
+        browser.reload();
+      }
     });
   }
 
@@ -154,6 +317,9 @@ function wireButtons() {
 
   if (browser) {
     browser.addEventListener("did-navigate", (e) => {
+      scriptInjected = false;
+      setRunningUI(false);
+
       const urlBar = $("url-bar");
       if (urlBar) urlBar.value = e.url;
     });
@@ -168,18 +334,11 @@ function wireButtons() {
       log("Instagram loaded. Login if needed, then click Start.");
     });
   }
-
-  document.addEventListener("keydown", async (e) => {
-    if (e.key !== "Enter" || e.repeat) return;
-    if (e.target && ["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
-
-    e.preventDefault();
-    await injectScript();
-  });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   wireButtons();
   switchMode("unfollow");
-  log("Ready. Click Open Instagram to start.");
+  loadNews();
+  log("Ready. Click Open Instagram, then Start.");
 });
