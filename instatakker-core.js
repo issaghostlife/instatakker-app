@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instatakker
 // @namespace    http://instatakker.io
-// @version      1.0.1
+// @version      2.0.1
 // @description  Instagram automation — unfollow + like everything (posts + comments) like a human
 // @author       Instatakker
 // @match        https://www.instagram.com/*
@@ -12,7 +12,7 @@
 (function() {
   'use strict';
 
-  const VERSION = '1.0.1';
+  const VERSION = '2.0.1';
 
   // ======================== CONFIG ========================
 
@@ -44,7 +44,7 @@
 
   let running = false;
   let stopped = false;
-  let mode = 'unfollow';
+  let mode = 'like';
 
   let state = {
     unfollowed: 0,
@@ -57,6 +57,9 @@
     emptyRounds: 0,
     consecutiveErrors: 0,
   };
+
+  // Sequential post index — goes in order, resets when scrolling loads new posts
+  let currentPostIndex = 0;
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const randDelay = (min, max) =>
@@ -89,7 +92,7 @@
     await sleep(randDelay(200, 800));
   }
 
-  // ======================== LIMIT TRACKING ========================
+  // ======================== LIMIT TRACKING (LEARNING) ========================
 
   function getAccountKey() {
     try {
@@ -121,7 +124,7 @@
     return {
       blockHistory: [],
       learnedHourlyCap: 200,
-      learnedPerPostCap: 150,
+      learnedPerPostCap: 100,
       totalSessions: 0,
       lastUpdated: null,
       maxSafeHourly: 0,
@@ -157,7 +160,7 @@
         recentBlocks.reduce((s, b) => s + b.hourlyCount, 0) / recentBlocks.length
       );
       limits.learnedHourlyCap = Math.max(40, Math.round(avgHourly * 0.7));
-      limits.learnedPerPostCap = Math.max(20, Math.round(limits.learnedHourlyCap / 3.5));
+      limits.learnedPerPostCap = Math.max(10, Math.round(limits.learnedHourlyCap / 4));
       log(`🧠 Blocked at ${state.hourlyCount}/hr. New safe limits: ${limits.learnedHourlyCap}/hr, ${limits.learnedPerPostCap}/post`);
     }
 
@@ -180,9 +183,10 @@
         perPostCap: Math.min(config.like.maxCommentsPerPost, Math.max(limits.maxSafePerPost + 5, limits.learnedPerPostCap)),
       };
     }
+    // Conservative start for new accounts
     return {
-      hourlyCap: Math.min(config.like.hourlyLimit, 100),
-      perPostCap: Math.min(config.like.maxCommentsPerPost, 50),
+      hourlyCap: Math.min(config.like.hourlyLimit, 80),
+      perPostCap: Math.min(config.like.maxCommentsPerPost, 40),
     };
   }
 
@@ -219,83 +223,220 @@
     return false;
   }
 
-  // ======================== POST SELECTION ========================
+  // ======================== POST SELECTION (FIXED — YOUR EXACT DIV) ========================
 
   /**
-   * Selects a post to open using the EXACT selector you provided:
-   * <div class="html-div xdj266r x14z9mp ...">
+   * FIXED: Get all post divs using the EXACT structure you provided:
+   *
+   * <div class="html-div xdj266r x14z9mp ... x1nhvcw1">                          ← OUTER (this is what we click)
+   *   <div class="xuk3077 x972fbf ... x11njtxf">                                  ← MIDDLE
+   *     <div class="html-div xexx8yu ... x1nhvcw1">                               ← INNER
+   *       <svg aria-label="Carousel" class="..." height="20" role="img"...>       ← CAROUSEL SVG
+   *     </div>
+   *   </div>
+   * </div>
+   *
+   * We find the Carousel SVG, then climb up to the outermost clickable div.
    */
   function getPostDivs() {
-    // Your exact class — we use a partial match since the class list is long
-    return [...document.querySelectorAll('div[class*="html-div"][class*="xdj266r"][class*="x78zum5"][class*="xdt5ytf"]')]
-      .filter(div => {
-        // Must be inside an article (feed post)
-        if (!div.closest('article')) return false;
-        // Must contain a link to /p/ (actual post, not story/ad)
-        if (!div.querySelector('a[href*="/p/"]')) return false;
-        // Must be visible
-        if (!div.offsetParent) return false;
-        return true;
+    // Find all carousel SVGs (most posts have this)
+    const carouselSvgs = [
+      ...document.querySelectorAll(
+        'svg[aria-label="Carousel"]'
+      )
+    ];
+
+    const postDivs = [];
+
+    // Track seen articles to deduplicate
+    const seenArticles = new Set();
+
+    for (const svg of carouselSvgs) {
+      // Climb up to the outermost clickable div
+      // Your structure: svg inside inner div > inside middle div > inside outer div
+      const innerDiv = svg.closest('div.html-div');
+      if (!innerDiv) continue;
+
+      // Get the parent of innerDiv — this should be the "xuk3077" div
+      const middleDiv = innerDiv.parentElement;
+      if (!middleDiv) continue;
+
+      // Get the parent of middleDiv — this is the OUTER clickable div
+      const outerDiv = middleDiv.parentElement;
+      if (!outerDiv) continue;
+
+      // Verify it's visible and inside an article
+      if (!outerDiv.offsetParent) continue;
+      const article = outerDiv.closest('article');
+      if (!article) continue;
+
+      // Deduplicate by article
+      const articleKey = article.dataset?.index || article.innerHTML?.substring(0, 50);
+      if (seenArticles.has(articleKey)) continue;
+      seenArticles.add(articleKey);
+
+      postDivs.push({
+        outerDiv,  // The clickable element
+        middleDiv,
+        innerDiv,
+        svg,
+        article
       });
+    }
+
+    // Also catch posts without carousel SVGs (single image posts)
+    // These are typically direct div children of article
+    const allArticles = document.querySelectorAll('article');
+    for (const article of allArticles) {
+      const articleKey = article.dataset?.index || article.innerHTML?.substring(0, 50);
+      if (seenArticles.has(articleKey)) continue;
+
+      // Find divs that look like post containers
+      const possiblePostDivs = article.querySelectorAll(
+        'div[class*="html-div"][class*="x78zum5"]'
+      );
+
+      for (const div of possiblePostDivs) {
+        if (!div.offsetParent) continue;
+        // Skip if it's already part of a carousel post
+        if (postDivs.some(p => p.article === article)) break;
+
+        // Check if this div has an anchor to /p/ or looks clickable
+        if (div.querySelector('a[href*="/p/"]') || div.querySelector('img')) {
+          seenArticles.add(articleKey);
+          postDivs.push({
+            outerDiv: div,
+            middleDiv: null,
+            innerDiv: null,
+            svg: null,
+            article
+          });
+          break;
+        }
+      }
+    }
+
+    // Sort by vertical position on screen (top to bottom = sequential order)
+    postDivs.sort((a, b) => {
+      const rectA = a.outerDiv.getBoundingClientRect();
+      const rectB = b.outerDiv.getBoundingClientRect();
+      return rectA.top - rectB.top;
+    });
+
+    return postDivs;
   }
 
   /**
-   * Click a post to open it in the dialog.
+   * FIXED: Opens posts SEQUENTIALLY (in order, top to bottom).
+   * Uses currentPostIndex to track position.
+   * Scrolls to load more when reaching the end.
    */
-  async function openPost(logArea) {
-    const postDivs = getPostDivs();
+  async function openNextPost(logArea) {
+    const posts = getPostDivs();
 
-    if (postDivs.length === 0) {
-      if (logArea) logArea.textContent = '⚠️ No post divs found. Scroll or navigate to feed.';
+    if (posts.length === 0) {
+      if (logArea) logArea.textContent = '⚠️ No posts found in feed';
       return false;
     }
 
-    // Pick a random post to appear more human
-    const idx = Math.floor(Math.random() * postDivs.length);
-    const postDiv = postDivs[idx];
+    // If we've gone through all visible posts, scroll to load more
+    if (currentPostIndex >= posts.length) {
+      if (logArea) logArea.textContent = `📜 Scrolling for more posts...`;
+      await humanScroll(1500);
+      await sleep(randDelay(2500, 4000));
 
-    log(`Clicking post div #${idx + 1}/${postDivs.length}`);
-    if (logArea) logArea.textContent = `📱 Opening post...`;
+      // Re-query for new posts
+      const newPosts = getPostDivs();
+      if (newPosts.length <= posts.length) {
+        // No new posts loaded — try scrolling more aggressively
+        await humanScroll(2000);
+        await sleep(3000);
+        const retryPosts = getPostDivs();
+        if (retryPosts.length <= posts.length) {
+          if (logArea) logArea.textContent = '⚠️ No more posts to load';
+          return false;
+        }
+        // Continue from where we left off
+        currentPostIndex = posts.length;
+      } else {
+        // New posts loaded
+        currentPostIndex = posts.length;
+      }
+    }
 
-    postDiv.click();
+    // Safety check — prevent out of bounds
+    const allPosts = getPostDivs();
+    if (currentPostIndex >= allPosts.length) {
+      currentPostIndex = 0;
+    }
+
+    const post = allPosts[currentPostIndex];
+    if (!post || !post.outerDiv) {
+      currentPostIndex++;
+      return false;
+    }
+
+    log(`Opening post #${currentPostIndex + 1}/${allPosts.length}`);
+    if (logArea) {
+      logArea.textContent = `📱 Opening post #${currentPostIndex + 1}/${allPosts.length} (${state.liked} liked)`;
+    }
+
+    // Scroll the post into view first
+    try {
+      post.outerDiv.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      await sleep(randDelay(800, 1500));
+    } catch(e) {}
+
+    // CLICK THE OUTER DIV — your exact element
+    post.outerDiv.click();
     await sleep(randDelay(2500, 4000));
 
     // Wait for dialog to appear
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
       if (stopped || !running) return false;
-      if (document.querySelector('div[role="dialog"] article')) return true;
-      await sleep(500);
+      if (document.querySelector('div[role="dialog"] article')) {
+        currentPostIndex++;
+        log(`Post #${currentPostIndex} opened successfully`);
+        return true;
+      }
+      await sleep(400);
     }
 
-    log('Post dialog did not appear after clicking');
+    // If dialog didn't appear, try clicking the inner area
+    if (post.middleDiv) {
+      post.middleDiv.click();
+      await sleep(3000);
+      for (let i = 0; i < 20; i++) {
+        if (document.querySelector('div[role="dialog"] article')) {
+          currentPostIndex++;
+          return true;
+        }
+        await sleep(400);
+      }
+    }
+
+    log('Post dialog did not appear — skipping');
+    currentPostIndex++;
     return false;
   }
 
   // ======================== LIKE POST ========================
 
-  /**
-   * Like the post using your EXACT SVG selector:
-   * <svg aria-label="Like" class="x1lliihq x1n2onr6 xyb1xck" ... height="24" ...>
-   * Distinguish from comment like SVGs by height="24" vs height="12"
-   */
   function getPostLikeButton() {
     const dialog = document.querySelector('div[role="dialog"]');
     if (!dialog) return null;
 
-    // Post like button: height="24" inside the dialog's article section
+    // Post like: height="24" vs comment like: height="12"
     const postLikeSvg = dialog.querySelector(
       'article svg[aria-label="Like"][height="24"], article svg[aria-label="Unlike"][height="24"]'
     );
     if (postLikeSvg) return postLikeSvg;
 
-    // Fallback: any "Like" svg with height="24" not inside comment areas
+    // Fallback
     const allLikeSvgs = [...dialog.querySelectorAll('svg[aria-label="Like"][height="24"]')];
     for (const svg of allLikeSvgs) {
-      if (!svg.closest('ul ul') && !svg.closest('li[role="button"]')) {
-        return svg;
-      }
+      if (!svg.closest('ul') && !svg.closest('li')) return svg;
     }
-
     return null;
   }
 
@@ -317,7 +458,6 @@
       return false;
     }
 
-    // Find clickable parent
     const clickable = likeSvg.closest('button') ||
                       likeSvg.closest('div[role="button"]') ||
                       likeSvg.closest('span')?.parentElement;
@@ -331,14 +471,8 @@
 
   // ======================== LIKE COMMENTS ========================
 
-  /**
-   * Load more comments by clicking the circle SVG you provided:
-   * <circle cx="12.001" cy="12.005" fill="none" r="10.5" stroke="currentColor"
-   *         stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></circle>
-   * This is inside a "Load more comments" button.
-   */
   function clickLoadMoreComments() {
-    // Strategy 1: The exact circle element you showed
+    // Your exact circle SVG
     const circle = document.querySelector(
       'circle[cx="12.001"][cy="12.005"][r="10.5"][stroke-linecap="round"]'
     );
@@ -350,11 +484,10 @@
       }
     }
 
-    // Strategy 2: Button text "Load more comments"
+    // Fallback
     const dialog = document.querySelector('div[role="dialog"]');
     if (dialog) {
-      const btns = [...dialog.querySelectorAll('button')];
-      for (const btn of btns) {
+      for (const btn of dialog.querySelectorAll('button')) {
         const text = (btn.innerText || '').trim().toLowerCase();
         if (text.includes('load more') || text.includes('view all')) {
           btn.click();
@@ -362,24 +495,14 @@
         }
       }
     }
-
     return false;
   }
 
-  /**
-   * Get unliked comment like buttons using your EXACT selector:
-   * <svg aria-label="Like" class="x1lliihq x1n2onr6 xyb1xck" fill="currentColor" height="12" ...>
-   * Key distinction from post like: height="12" vs height="24"
-   *
-   * To check if already liked, we check:
-   * - fill is NOT "currentColor" (liked comments get a colored fill)
-   * - OR the parent button has a colored fill
-   */
   function getUnlikedCommentButtons() {
     const dialog = document.querySelector('div[role="dialog"]');
     if (!dialog) return [];
 
-    // Comment like SVGs: height="12" with aria-label="Like"
+    // Comment likes: height="12"
     const commentLikeSvgs = [...dialog.querySelectorAll('svg[aria-label="Like"][height="12"]')];
 
     const seen = new Set();
@@ -390,55 +513,35 @@
       if (!li || seen.has(li)) continue;
       seen.add(li);
 
-      // Check if already liked
-      // Instagram sets fill to a specific color (not "currentColor") when liked
       const fill = svg.getAttribute('fill') || '';
       const color = svg.getAttribute('color') || '';
-      const parentBtn = svg.closest('button') || svg.closest('div[role="button"]');
 
       let liked = false;
-      // If fill is no longer "currentColor", it's likely liked
       if (fill !== 'currentColor' && fill !== '' && fill !== 'none') {
-        // Check if it's a colored fill (not black/white)
-        const coloredFills = ['rgb(', '#ed', '#ff', '#fe'];
-        if (coloredFills.some(c => fill.startsWith(c) || fill.includes(c))) {
+        if (fill.startsWith('rgb(') || fill.startsWith('#ed') || fill.startsWith('#ff') || fill.startsWith('#fe')) {
           liked = true;
         }
       }
 
-      if (!liked) {
-        unliked.push(svg);
-      }
+      if (!liked) unliked.push(svg);
     }
 
     return unliked;
   }
 
-  /**
-   * Click a comment like button.
-   */
   function likeComment(svg) {
-    // The clickable parent — usually a button or div[role="button"]
     const clickable = svg.closest('button') ||
                       svg.closest('div[role="button"]') ||
                       svg.closest('span')?.parentElement;
-    if (!clickable) return false;
-
-    // Make sure it's visible
-    if (!clickable.offsetParent) return false;
-
+    if (!clickable || !clickable.offsetParent) return false;
     clickable.click();
     return true;
   }
 
-  /**
-   * Scroll the comment section.
-   */
   function scrollCommentSection() {
     const dialog = document.querySelector('div[role="dialog"]');
     if (!dialog) return false;
 
-    // Find scrollable containers
     const scrollables = [...dialog.querySelectorAll('div')].filter(d => {
       try {
         const style = window.getComputedStyle(d);
@@ -454,44 +557,33 @@
       scrollables[0].scrollTop = scrollables[0].scrollHeight;
       return true;
     }
-
     return false;
   }
 
-  /**
-   * Close the post dialog.
-   */
   async function closePost() {
-    // Escape key first (most reliable)
     document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Escape',
-      keyCode: 27,
-      which: 27,
-      bubbles: true,
-      cancelable: true
+      key: 'Escape', keyCode: 27, which: 27,
+      bubbles: true, cancelable: true
     }));
-    await sleep(1000);
+    await sleep(800);
 
-    // If still open, try close button
     if (document.querySelector('div[role="dialog"]')) {
       const closeSvg = document.querySelector('svg[aria-label="Close"]');
       if (closeSvg) {
         const btn = closeSvg.closest('button');
         if (btn) btn.click();
-        await sleep(1000);
+        await sleep(800);
       }
     }
 
-    // Wait for dialog to close
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 15; i++) {
       if (!document.querySelector('div[role="dialog"] article')) return true;
       await sleep(300);
     }
-
     return !document.querySelector('div[role="dialog"] article');
   }
 
-  // ======================== LIKE ALL COMMENTS ENGINE ========================
+  // ======================== LIKE ALL COMMENTS ========================
 
   async function likeAllComments(logArea, statusEl) {
     let commentsLiked = 0;
@@ -503,20 +595,16 @@
       safeLimits.perPostCap
     );
 
-    // Wait for comments to load initially
     await sleep(randDelay(2000, 3500));
 
     for (let round = 0; round < 80; round++) {
       if (stopped || !running) break;
 
-      // Check per-post cap
       if (commentsLiked >= perPostCap) {
         if (logArea) logArea.textContent = `✅ Hit ${commentsLiked} comment cap on this post`;
-        log(`Reached per-post comment cap (${commentsLiked})`);
         break;
       }
 
-      // Check hourly
       if (state.hourlyCount >= safeLimits.hourlyCap) {
         if (statusEl) {
           statusEl.textContent = `⏳ Hit hourly cap (${state.hourlyCount})`;
@@ -526,23 +614,16 @@
         break;
       }
 
-      // Step 1: Click "Load more comments" (the circle SVG you showed)
       const loadClicked = clickLoadMoreComments();
       if (loadClicked) {
         await sleep(randDelay(2000, 3500));
         roundsWithoutNewComments = 0;
-        if (commentsLiked > 0 && logArea) {
-          logArea.textContent = `📄 Loaded more comments (${commentsLiked} liked)`;
-        }
       }
 
-      // Step 2: Scroll
       scrollCommentSection();
       await sleep(randDelay(1000, 2000));
 
-      // Step 3: Get unliked comment buttons
       const unlikedSvgs = getUnlikedCommentButtons();
-      log(`Round ${round}: found ${unlikedSvgs.length} unliked comments`);
 
       if (unlikedSvgs.length > 0) {
         roundsWithoutNewComments = 0;
@@ -550,8 +631,6 @@
         for (const svg of unlikedSvgs) {
           if (stopped || !running) break;
           if (!document.contains(svg)) continue;
-
-          // Check caps
           if (commentsLiked >= perPostCap) break;
           if (state.hourlyCount >= safeLimits.hourlyCap) {
             recordBlock('hourly_cap_mid_comment');
@@ -569,11 +648,9 @@
               state.commentsLiked++;
 
               if (logArea) {
-                logArea.textContent = `💬 Liked ${commentsLiked}/${perPostCap} comments (total: ${state.liked})`;
+                logArea.textContent = `💬 Liked ${commentsLiked}/${perPostCap} (total: ${state.liked})`;
               }
-              if (statusEl) {
-                statusEl.textContent = `❤️${state.liked}`;
-              }
+              if (statusEl) statusEl.textContent = `❤️${state.liked}`;
               updateUI();
 
               await sleep(humanDelay(
@@ -589,7 +666,7 @@
               await sleep(500);
             }
           } catch(e) {
-            log(`Error liking comment: ${e.message}`);
+            log(`Error: ${e.message}`);
             state.consecutiveErrors++;
           }
         }
@@ -597,7 +674,6 @@
         roundsWithoutNewComments++;
         if (roundsWithoutNewComments >= 4) {
           if (logArea) logArea.textContent = `✅ Liked ${commentsLiked} comments on this post`;
-          log(`No more comments to like (${commentsLiked} total)`);
           break;
         }
         await sleep(randDelay(2000, 4000));
@@ -613,16 +689,17 @@
   // ======================== MAIN ENGINE ========================
 
   async function instatakkerEngine() {
-    state.startTime = state.startTime || Date.now();
-
     const logArea = document.getElementById('itk-log');
     const statusEl = document.getElementById('itk-status');
     const safeLimits = getSafeLimits();
 
+    // Reset index when starting fresh
+    currentPostIndex = 0;
+
     if (limits.blockHistory.length >= 2) {
-      if (logArea) logArea.textContent = `🧠 Learned: ~${safeLimits.hourlyCap}/hr | Max safe: ${limits.maxSafeHourly}/hr`;
+      if (logArea) logArea.textContent = `🧠 Learned: ${safeLimits.hourlyCap}/hr, ${safeLimits.perPostCap}/post`;
     } else {
-      if (logArea) logArea.textContent = `🆕 New account — starting conservative (${safeLimits.hourlyCap}/hr)`;
+      if (logArea) logArea.textContent = `🆕 Conservative: ${safeLimits.hourlyCap}/hr, ${safeLimits.perPostCap}/post`;
     }
 
     while (running && !stopped) {
@@ -630,14 +707,13 @@
       if (Date.now() - state.hourlyReset > 3600000) {
         state.hourlyCount = 0;
         state.hourlyReset = Date.now();
-        log('⏰ Hourly counter reset');
-        if (logArea) logArea.textContent = '⏰ Hourly counter reset';
+        if (logArea) logArea.textContent = '⏰ Hourly reset';
       }
 
+      // Check hourly cap (LEARNED)
       if (state.hourlyCount >= safeLimits.hourlyCap) {
-        const waitMs = 3600000 - (Date.now() - state.hourlyReset);
-        const waitMin = Math.ceil(waitMs / 60000);
-        if (logArea) logArea.textContent = `⏳ Hit cap (${state.hourlyCount}) — waiting ${waitMin}min`;
+        const waitMin = Math.ceil((3600000 - (Date.now() - state.hourlyReset)) / 60000);
+        if (logArea) logArea.textContent = `⏳ Hit ${state.hourlyCount}/${safeLimits.hourlyCap} cap — waiting ${waitMin}min`;
         if (statusEl) {
           statusEl.textContent = `⏳ Waiting ${waitMin}min`;
           statusEl.style.background = '#ff6b9d22';
@@ -645,7 +721,7 @@
         recordBlock('hourly_cap_reached');
         await sleep(randDelay(300000, 600000));
         if (state.hourlyCount >= safeLimits.hourlyCap) {
-          await sleep(Math.min(waitMs + 5000, 3600000));
+          await sleep(Math.min((3600000 - (Date.now() - state.hourlyReset)) + 5000, 3600000));
         }
         state.hourlyCount = 0;
         state.hourlyReset = Date.now();
@@ -653,72 +729,75 @@
         continue;
       }
 
-      const currentCount = state.liked;
-      if (currentCount >= config.like.maxLikes) {
-        if (logArea) logArea.textContent = `✅ Liked ${currentCount}`;
+      // Check total cap
+      if (state.liked >= config.like.maxLikes) {
+        if (logArea) logArea.textContent = `✅ Done: liked ${state.liked}`;
         break;
       }
 
-      // ===================== LIKE MODE =====================
-
-      // Step 1: Open a post using your exact div selector
-      const opened = await openPost(logArea);
+      // --- OPEN NEXT POST IN ORDER (sequential, not random) ---
+      const opened = await openNextPost(logArea);
       if (!opened) {
-        if (logArea) logArea.textContent = '⚠️ No posts to open. Scroll or navigate to feed.';
+        if (logArea) logArea.textContent = '⚠️ No more posts. Scroll or navigate to feed.';
         await sleep(3000);
         continue;
       }
 
-      // Step 2: Like the post
+      // --- LIKE THE POST ---
       await humanHoverDelay();
       const postResult = await likeCurrentPost();
+
       if (postResult === true) {
         state.liked++;
         state.hourlyCount++;
         state.postsEngaged++;
-        if (logArea) logArea.textContent = `❤️ Liked post (${state.liked} total)`;
+        if (logArea) logArea.textContent = `❤️ Liked post #${state.postsEngaged} (${state.liked} total, ${state.hourlyCount}/${safeLimits.hourlyCap}hr)`;
         if (statusEl) statusEl.textContent = `❤️${state.liked}`;
         log(`Liked post #${state.postsEngaged}`);
         await sleep(humanDelay(3000, 8000));
       } else if (postResult === 'already_liked') {
-        if (logArea) logArea.textContent = `📌 Post already liked (${state.liked} total)`;
+        if (logArea) logArea.textContent = `📌 Already liked (${state.liked} total)`;
+        state.postsEngaged++;
+        await sleep(randDelay(1500, 3000));
       } else {
-        if (logArea) logArea.textContent = `⚠️ Could not like post (${state.liked} total)`;
+        if (logArea) logArea.textContent = `⚠️ Like button not found (${state.liked} total)`;
+        await sleep(randDelay(1500, 3000));
       }
 
-      // Step 3: Like ALL comments
-      if (logArea) logArea.textContent = `💬 Liking all comments...`;
+      // --- LIKE ALL COMMENTS (respects LEARNED per-post cap) ---
+      if (logArea) logArea.textContent = `💬 Liking comments...`;
       const commentCount = await likeAllComments(logArea, statusEl);
       if (commentCount > 0) {
-        log(`✅ Post ${state.postsEngaged}: liked ${commentCount} comments`);
+        log(`✅ Liked ${commentCount} comments on post #${state.postsEngaged}`);
         updateUI();
       } else {
         if (logArea) logArea.textContent = `💬 No comments to like`;
       }
 
-      // Step 4: Close post and move on
+      // --- CLOSE POST ---
       if (!stopped && running) {
         if (logArea) logArea.textContent = `➡️ Closing post...`;
         await closePost();
         await sleep(randDelay(1500, 3000));
 
-        // Scroll down a bit
-        await humanScroll(700);
+        // Small scroll to move past the closed post
+        await humanScroll(400);
         await sleep(randDelay(1500, 3000));
 
+        // Update learning
         recordSafeOperation();
         const avgComments = state.postsEngaged > 0
           ? Math.round(state.commentsLiked / state.postsEngaged)
           : 0;
         if (logArea) {
-          logArea.textContent = `📊 ${state.liked} liked | ${state.hourlyCount}/hr | ~${avgComments} comments/post`;
+          logArea.textContent = `📊 ${state.liked} liked | ${state.hourlyCount}/${safeLimits.hourlyCap}hr | ~${avgComments}/post`;
         }
       }
     }
 
     running = false;
-    if (logArea && !logArea.textContent.includes('Done') && !logArea.textContent.includes('No more')) {
-      logArea.textContent = `■ Stopped (${state.liked} liked)`;
+    if (logArea && !logArea.textContent.includes('Done')) {
+      logArea.textContent = `■ Stopped (${state.liked} liked, ${state.commentsLiked} comments)`;
     }
     if (statusEl) {
       statusEl.textContent = `■`;
@@ -726,7 +805,7 @@
     }
 
     saveLimits(limits);
-    log(`Engine stopped. Learning data saved. Total sessions: ${limits.totalSessions}`);
+    log(`Stopped. ${limits.totalSessions} sessions. Learned: ${limits.learnedHourlyCap}/hr, ${limits.learnedPerPostCap}/post`);
   }
 
   // ======================== UI ========================
@@ -738,14 +817,11 @@
     const hourlyEl = document.getElementById('itk-hourly');
     const engagedEl = document.getElementById('itk-engaged');
 
-    const currentCount = state.liked;
-    const maxCount = config.like.maxLikes;
-
-    if (countEl) countEl.textContent = currentCount;
-    if (progressEl) progressEl.textContent = `${currentCount} / ${maxCount}`;
-    if (barEl) barEl.style.width = `${(currentCount / maxCount) * 100}%`;
+    if (countEl) countEl.textContent = state.liked;
+    if (progressEl) progressEl.textContent = `${state.liked} / ${config.like.maxLikes}`;
+    if (barEl) barEl.style.width = `${(state.liked / config.like.maxLikes) * 100}%`;
     if (hourlyEl) hourlyEl.textContent = `${state.hourlyCount} / ${getSafeLimits().hourlyCap}`;
-    if (engagedEl) engagedEl.textContent = state.postsEngaged;
+    if (engagedEl) engagedEl.textContent = state.commentsLiked;
   }
 
   function createPanel() {
@@ -781,11 +857,11 @@
         ${hasLearned ? `
         <div style="font-size:10px;color:#ff6b9d;background:#ff6b9d10;padding:4px 8px;border-radius:4px;margin-bottom:8px;border:1px solid #ff6b9d25;display:flex;justify-content:space-between;">
           <span>🧠 ${limits.totalSessions} sessions</span>
-          <span>max ${limits.maxSafeHourly}/hr safe</span>
+          <span>max ${limits.learnedHourlyCap}/hr safe</span>
         </div>
         ` : `
         <div style="font-size:10px;color:#888;background:#1a1a2e;padding:4px 8px;border-radius:4px;margin-bottom:8px;text-align:center;">
-          New account — building activity profile
+          New — learning limits as you go
         </div>
         `}
 
@@ -821,7 +897,7 @@
         </div>
 
         <div style="font-size:10px;opacity:0.4;margin-top:6px;text-align:center;">
-          Navigate to feed → Press Enter
+          Feed → Enter to start | Enter again to stop
         </div>
 
         <details style="margin-top:8px;">
@@ -833,6 +909,9 @@
             <input type="number" id="itk-cfg-hourly" value="${config.like.hourlyLimit}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
             <label style="font-size:10px;opacity:0.6;">Max comments/post:</label>
             <input type="number" id="itk-cfg-comments" value="${config.like.maxCommentsPerPost}" style="width:100%;padding:3px 6px;border:1px solid rgba(255,255,255,0.08);border-radius:4px;background:#1a1a2e;color:#e0e0e0;font-size:11px;margin:2px 0;">
+          </div>
+          <div style="font-size:9px;opacity:0.3;margin-top:6px;text-align:center;">
+            🧠 Learned: ${limits.learnedHourlyCap}/hr, ${limits.learnedPerPostCap}/post | ${limits.totalSessions} sessions
           </div>
         </details>
       </div>
@@ -860,7 +939,6 @@
     // Tab switching
     const unfollowTab = panel.querySelector('#itk-mode-unfollow');
     const likeTab = panel.querySelector('#itk-mode-like');
-    const settingsPerPost = document.getElementById('itk-cfg-comments')?.closest('div');
 
     function switchMode(newMode) {
       if (running) return;
@@ -874,7 +952,7 @@
 
       const footer = panel.querySelector('div[style*="font-size:10px;opacity:0.4;margin-top:6px;"]');
       if (footer) {
-        footer.textContent = isLike ? 'Navigate to feed → Press Enter' : 'Open Following list → Press Enter';
+        footer.textContent = isLike ? 'Feed → Enter' : 'Following list → Enter';
       }
     }
 
@@ -907,7 +985,6 @@
       const logArea = document.getElementById('itk-log');
 
       if (!running) {
-        // START
         stopped = false;
         running = true;
         state.emptyRounds = 0;
@@ -921,7 +998,7 @@
           hourlyCount: state.hourlyCount,
         }));
 
-        log(`Engine started in ${mode} mode`);
+        log(`Started in ${mode} mode`);
         if (statusEl) {
           statusEl.textContent = `▶ Running (${mode})`;
           statusEl.style.background = '#00ff8822';
@@ -935,10 +1012,9 @@
         }
         running = false;
       } else {
-        // STOP
         stopped = true;
         running = false;
-        log('Stopped by user');
+        log('Stopped');
         if (statusEl) {
           statusEl.textContent = `■ Stopped`;
           statusEl.style.background = '';
@@ -958,26 +1034,23 @@
       if (Date.now() - state.hourlyReset > 3600000) {
         state.hourlyCount = 0;
         state.hourlyReset = Date.now();
-        if (logArea) logArea.textContent = '⏰ Hourly counter reset';
+        if (logArea) logArea.textContent = '⏰ Hourly reset';
       }
 
       if (state.hourlyCount >= config.unfollow.hourlyLimit) {
         const waitMin = Math.ceil((3600000 - (Date.now() - state.hourlyReset)) / 60000);
-        if (logArea) logArea.textContent = `⏳ Waiting ${waitMin}min for hourly reset`;
+        if (logArea) logArea.textContent = `⏳ Waiting ${waitMin}min`;
         await sleep(300000);
         continue;
       }
 
       if (state.unfollowed >= config.unfollow.maxUnfollows) {
-        if (logArea) logArea.textContent = `✅ Done: unfollowed ${state.unfollowed}`;
+        if (logArea) logArea.textContent = `✅ Done: ${state.unfollowed}`;
         break;
       }
 
-      // Open following list if not open
       if (!document.querySelector('div[role="dialog"]')) {
-        const profileLink = document.querySelector('a[href*="/"]');
-        // User needs to open following list manually
-        if (logArea) logArea.textContent = '⚠️ Open Following list first (Profile → Following)';
+        if (logArea) logArea.textContent = '⚠️ Open Following list first';
         await sleep(3000);
         continue;
       }
@@ -986,7 +1059,7 @@
       if (buttons.length === 0) {
         state.emptyRounds++;
         if (state.emptyRounds >= config.unfollow.emptyRoundsBeforeStop) {
-          if (logArea) logArea.textContent = `🏁 No more to unfollow (${state.unfollowed} done)`;
+          if (logArea) logArea.textContent = `🏁 Done (${state.unfollowed})`;
           break;
         }
         await sleep(2000);
@@ -1047,36 +1120,6 @@
     createPanel();
   }
 
-  console.log(
-    `%c⏹ Instatakker v${VERSION} loaded`,
-    'color: #ff0050; font-size: 14px; font-weight: bold;'
-  );
-  console.log(`%c${mode === 'like' ? 'Like' : 'Unfollow'} mode | Press Enter to start`, 'color: #888; font-size: 12px;');
+  console.log(`%c⏹ Instatakker v${VERSION} loaded`, 'color: #ff0050; font-size: 14px; font-weight: bold;');
 
-
-// ======================== APP CONTROL API ========================
-
-window.Instatakker = {
-  start: async function(selectedMode = "unfollow") {
-    if (running) return;
-
-    mode = selectedMode;
-    stopped = false;
-    running = true;
-    state.emptyRounds = 0;
-    state.consecutiveErrors = 0;
-
-    log(`Engine started in ${mode} mode`);
-
-    await instatakkerEngine();
-
-    running = false;
-  },
-
-  stop: function() {
-    stopped = true;
-    running = false;
-    log("Stopped by app");
-  }
-};
 })();
