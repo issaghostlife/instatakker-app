@@ -1,0 +1,11 @@
+{
+  "version": "1.0.1",
+  "title": "Instatakker v1.0.1",
+  "items": [
+    "New advanced UI added.",
+    "Settings and News now stay visible.",
+    "Start button controls automation directly.",
+    "Live news can update from GitHub without reinstalling."
+  ],
+  "notice": "Copyright © 2026 Instatakker. All rights reserved."
+}
