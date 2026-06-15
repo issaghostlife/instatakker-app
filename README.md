@@ -5,13 +5,21 @@
 <h1 align="center">InstaTakker App</h1>
 
 <p align="center">
-  Desktop Instagram workflow tool for liking user posts and managing unfollows with a built-in control panel.
+  Desktop Instagram workflow tool for liking user posts, managing unfollows, and running simple creator-focused actions from one clean control panel.
 </p>
 
 <p align="center">
   <strong>Portable Windows App • Built-in Browser • Local Settings • Simple Controls</strong>
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/J5KQ6rqZeP">
+    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord">
+  </a>
+  <a href="https://github.com/issaghostlife/instatakker-app/releases">
+    <img src="https://img.shields.io/badge/Download-Releases-ff004c?style=for-the-badge&logo=github&logoColor=white" alt="Download Releases">
+  </a>
+</p>
 ---
 ## Download for Windows
 
